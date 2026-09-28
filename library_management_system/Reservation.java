@@ -10,6 +10,6 @@ public class Reservation{
     }
 
     public String toString(){
-        return user + ": " + item;
+        return item + " is reserved by " + user;
     }
 }

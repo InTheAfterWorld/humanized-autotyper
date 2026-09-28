@@ -9,7 +9,11 @@ public class Loan{
         user = _user_;
     }
 
+    public Item getItem() {
+        return item;
+    }
+
     public String toString(){
-        return user + ": " + item;
+        return item + " is borrowed by " + user;
     }
 }

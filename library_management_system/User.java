@@ -8,11 +8,11 @@ public class User{
         name = _name_;
     }
 
-    public getId() {
+    public int getId() {
         return id;
     }
 
-    public getName() {
+    public String getName() {
         return name;
     }
 }

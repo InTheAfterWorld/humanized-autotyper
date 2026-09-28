@@ -1,5 +1,3 @@
-package library_management_system;
-
 public abstract class Item {
 
     private String title;
@@ -21,6 +19,10 @@ public abstract class Item {
         types = _types_;
     }
 
+    public int getId(){
+        return id;
+    }
+
     public String getTitle() {
         return title;
     }
@@ -31,5 +33,23 @@ public abstract class Item {
 
     public String getGenre() {
         return genre;
+    }
+
+    public boolean isAvailable() {
+        return availability;
+    }
+
+    public String getType() {
+        return types;
+    }
+
+    public void setAvailable(boolean ava) {
+        availability = ava;
+    }
+
+    public String toString() {
+        return id + " | " + getType() + " | " + title + " | "
+                + author + " | " + genre + " | " + rating + " | "
+                + (availability ? "Available" : "Unavailable");
     }
 }
