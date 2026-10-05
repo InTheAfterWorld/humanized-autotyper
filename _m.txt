@@ -1,0 +1,29 @@
+fix(types): resolve all 19 pyright errors, including a real Key.escape crash
+
+Ran pyright over the whole package rather than one file, which surfaced
+19 errors that per-file checking had missed.
+
+The important one is a runtime bug, not a type complaint: pynput's escape
+key is Key.esc, and Key.escape does not exist. key_escape() would have
+raised AttributeError on a live run, while every dry-run stayed green
+because dry-run never touches the attribute. Added
+test_combo_keys_use_real_pynput_names, which asserts the real Key members
+exist and that plausible-looking names (escape/control/return/del) do not,
+so this class of error cannot come back.
+
+Also fixed:
+- machine._run_multi accessed self.mode, which is Optional and only
+  narrowed in run(); it now binds a local with an assert so the checker can
+  see it, which is also the true precondition.
+- main._build_mode returned SingleFileMode(None) as a placeholder that main
+  immediately overwrote. source is typed str, so passing None was a lie;
+  it now returns None and main constructs the mode once it has read the
+  source.
+- Tests replaced dynamic type("T", (), {})() stubs and post-hoc attribute
+  assignment with _StubTyper, whose attributes are statically visible.
+- Controller.press/release stubs now use the parameter name key, matching
+  pynput's signature.
+
+pyright: 19 errors down to 0 (3 remaining warnings are pynput missing
+stubs). Tests: 43 sanity checks pass (1 new), validate + gui selftest
+pass, notepad path unchanged (chars=5506).

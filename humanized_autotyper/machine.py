@@ -160,6 +160,10 @@ class AutoTyper:
         - summary 里的 final_matches_source 只有在 mode.verify_trustworthy()
           为真时才可信，否则置 None 并在 per_file 里给出逐文件结论。
         """
+        # 本方法只在 run() 判定 mode 非空且 multi_target 时调用，但检查器
+        # 无法推断这一点；先取局部变量，既收窄了类型也少写 4 次 self.mode。
+        mode = self.mode
+        assert mode is not None, "_run_multi 只应在 mode 已设置时调用"
         targets = self.targets or []
         self.executor.start()
         self.executor.check_window()
@@ -181,7 +185,7 @@ class AutoTyper:
                     except Exception:
                         pass
                 try:
-                    self.mode.before_type(target, self)
+                    mode.before_type(target, self)
                 except Exception as exc:
                     self.logger.log("FILE", "acquire_failed",
                                      f"{target.path}: {exc!r}", 0)
@@ -191,7 +195,7 @@ class AutoTyper:
                 self._drive()
                 result = {}
                 try:
-                    result = self.mode.after_type(target, self) or {}
+                    result = mode.after_type(target, self) or {}
                 except Exception as exc:
                     result = {"ok": False, "error": f"校验失败: {exc}"}
                 total_chars += self.stats["chars"]
@@ -217,9 +221,9 @@ class AutoTyper:
         # 内存缓冲区在多目标模式下不能代表真实文档（编辑器会改写、且每个文件
         # 都会重置），所以不能报 final_matches_source——由 per_file 给出结论。
         summary["final_matches_source"] = (
-            None if not self.mode.verify_trustworthy()
+            None if not mode.verify_trustworthy()
             else self.buffer.text == self.source)
-        summary["verify_trustworthy"] = self.mode.verify_trustworthy()
+        summary["verify_trustworthy"] = mode.verify_trustworthy()
         try:
             self.logger.mark_end(summary)
         except Exception:

@@ -328,7 +328,13 @@ class Executor:
         return [self._Key.ctrl, kc]
 
     def key_escape(self):
-        self.tap_combo([self._Key.escape] if self._Key else [],
+        """Escape。
+
+        注意是 `Key.esc` 而不是 `Key.escape`——pynput 的 Key 枚举里没有
+        `escape`，写成后者会在实机直接 AttributeError。类型检查器报"属性
+        escape 未知"就是在提醒这个（见 test_combo_keys_use_real_pynput_names）。
+        """
+        self.tap_combo([self._Key.esc] if self._Key else [],
                        label="escape")
 
     def key_select_all(self):

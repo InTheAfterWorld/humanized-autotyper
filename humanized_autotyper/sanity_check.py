@@ -978,8 +978,10 @@ def test_combo_keys_dry_run_and_ordering():
     ex2 = Executor(cfg2, DelayModel(cfg2, _r.Random(1)), Logger(cfg2), Killer())
     assert ex2.controller is not None
     events = []
-    ex2.controller.press = lambda k: events.append(("press", str(k)))
-    ex2.controller.release = lambda k: events.append(("release", str(k)))
+    # 参数名必须叫 key：pynput 的签名是 press(key)，写成别的名字虽然
+    # 运行无碍，但类型检查会判"参数名称不匹配"。
+    ex2.controller.press = lambda key: events.append(("press", str(key)))
+    ex2.controller.release = lambda key: events.append(("release", str(key)))
     ex2.listener = None                      # 别真的去监听键盘
 
     ex2.tap_combo(["A", "B", "C"], label="triple")
@@ -1139,7 +1141,7 @@ class _NullLogger:
 
 def test_vscode_verify_reports_diff():
     """回读校验必须报出**第一个差异的行号**，否则多文件场景无法排查。"""
-    from .modes import VSCodeMode
+    from .modes import VSCodeMode, Target
 
     m = VSCodeMode(".")
 
@@ -1166,14 +1168,27 @@ def test_vscode_verify_reports_diff():
     assert r4["line"] == 2 and r4["col"] == 1, r4
 
     # 读不回文件时必须 ok=False 而不是抛异常
-    assert m._read_back(_FakeTarget(abs_path=None)) is None
+    assert m._read_back(Target(path="x.py", content="")) is None, \
+        "没有 abs_path 的 Target 读不回内容"
     print("PASS vscode_verify_reports_diff")
 
 
-class _FakeTarget:
-    """只给 _read_back 用的最小 Target 替身（没有 abs_path 就该返回 None）。"""
-    def __init__(self, abs_path=None):
-        self.abs_path = abs_path
+class _StubTyper:
+    """给 VSCodeMode.before_type/after_type 用的替身 typer。
+
+    早先这里用 `type("T", (), {})()` 再逐个赋属性，那会让类型检查器判
+    "属性 X 未知"（动态创建的类没有任何属性声明）。改成显式类体后属性可
+    被静态推断，而且 IDE 跳转也能用。
+    """
+
+    def __init__(self, cfg, executor=None, logger=None):
+        self.cfg = cfg
+        self.executor = executor
+        self.logger = logger or _NullLogger()
+        self.slept = []
+
+    def _sleep(self, seconds, active=True, chunk=0.25):
+        self.slept.append(seconds)
 
 
 def test_vscode_reread_matches_disk():
@@ -1190,17 +1205,13 @@ def test_vscode_reread_matches_disk():
 
         class FakeTyper:
             pass
-        ty = FakeTyper()
-        # 必须 dry_run=False：dry-run 下 after_type 不做比对（恒真式，见实现）
-        ty.cfg = fast_cfg(dry_run=False)
+        ty = _StubTyper(fast_cfg(dry_run=False))
         sent = []
 
         class FakeExec:
             def key_save(self):
                 sent.append("ctrl+s")
         ty.executor = FakeExec()
-        ty._sleep = lambda *a, **k: None
-        ty.logger = _NullLogger()
 
         # 磁盘内容 == 期望 -> 通过，且确实发了 Ctrl+S
         res = m.after_type(t, ty)
@@ -1249,15 +1260,12 @@ def test_vscode_strips_bom():
         # 回读也要剥：编辑器写回带 BOM 的文件时应判定为一致
         from .modes import Target
         m2 = VSCodeMode(d, settings_paths=[], save_settle_s=0.0)
-        ty = type("T", (), {})()
-        ty.cfg = fast_cfg(dry_run=False)
+        ty = _StubTyper(fast_cfg(dry_run=False))
 
         class FakeExec:
             def key_save(self):
                 pass
         ty.executor = FakeExec()
-        ty._sleep = lambda *a, **k: None
-        ty.logger = _NullLogger()
         res = m2.after_type(Target(path="bom.py", content="print('x')\n",
                                   abs_path=p), ty)
         assert res["ok"] is True, res
@@ -1352,9 +1360,7 @@ def test_vscode_dry_run_does_not_fake_verification():
         m = VSCodeMode(d, settings_paths=[])
         t = Target(path="dry.py", content=content, abs_path=path)
 
-        ty = type("T", (), {})()
-        ty.cfg = fast_cfg()                  # dry_run=True
-        ty.executor = None
+        ty = _StubTyper(fast_cfg())          # dry_run=True
         res = m.after_type(t, ty)
         assert res["ok"] is None, \
             f"dry-run 不该报通过（恒真式）: {res}"
@@ -1373,6 +1379,42 @@ def s_files_ok_ignores_unverified():
     unver = sum(1 for f in per_file if f["ok"] is None)
     assert (ok, unver) == (1, 1), (ok, unver)
     return True
+
+
+def test_combo_keys_use_real_pynput_names():
+    """回归：所有用到的 pynput Key / KeyCode 成员必须真实存在。
+
+    pynput 的转义键叫 `Key.esc`，**没有** `Key.escape`——写成后者 dry-run
+    一路绿灯（不发键），实机却会 AttributeError。这类错误只有对着真实对象
+    取属性才能发现，所以这里直接 getattr 一遍。
+    """
+    from pynput.keyboard import Key, KeyCode
+
+    for name in ("esc", "ctrl", "shift", "enter", "backspace", "delete",
+                 "left", "right", "up", "down"):
+        assert hasattr(Key, name), f"pynput Key 没有 {name}"
+
+    # 这两个"看起来对但不存在"的写法必须被拒
+    for bogus in ("escape", "control", "return", "del"):
+        assert not hasattr(Key, bogus), \
+            f"pynput Key 居然有 {bogus}？那本测试的假设就过时了"
+
+    assert KeyCode.from_char("a") is not None
+    assert KeyCode.from_char("!") is not None
+    # _tap_special 用的名字也必须存在
+    for name in ("enter", "backspace", "delete", "left", "right", "up", "down"):
+        getattr(Key, name)
+
+    # executor 里实际用到的组合键解析也要能跑通
+    from .executor import Executor, Killer, Logger
+    cfg = fast_cfg(dry_run=False)
+    ex = Executor(cfg, DelayModel(cfg, random.Random(1)), Logger(cfg), Killer())
+    assert ex._Key is not None and ex._KeyCode is not None
+    for ch in ("s", "p", "a"):
+        keys = ex._ctrl_key(ch)
+        assert keys and len(keys) == 2, f"Ctrl+{ch} 组合解析失败"
+    assert ex._Key.esc is not None, "key_escape 依赖的 Key.esc 必须存在"
+    print("PASS combo_keys_use_real_pynput_names")
 
 
 def main():
@@ -1411,6 +1453,7 @@ def main():
     test_modes_multi_target_resets_between_files()
     test_modes_kill_stops_remaining_files()
     test_combo_keys_dry_run_and_ordering()
+    test_combo_keys_use_real_pynput_names()
     test_vscode_enumeration()
     test_vscode_preflight_blocks_bad_setup()
     test_vscode_verify_reports_diff()

@@ -109,8 +109,13 @@ def parse_args(argv):
 def _build_mode(args):
     """按 --mode 构造模式实例。多目标模式在这里枚举 + preflight。
 
-    返回 (mode, targets)；targets 为 None 表示单文档路径（notepad），
-    此时 source/source_desc 已由调用方准备好。
+    返回 (mode, targets)：
+    - 多目标模式（vscode）：返回 (mode, targets 列表)
+    - 单文档路径（notepad）：返回 (None, None)，此时 source 还没读，
+      由 main() 读完 source 后再构造 SingleFileMode。
+
+    早先这里返回 SingleFileMode(None) 当占位，那是个类型谎言：source 是
+    str，传 None 既不合法也毫无意义（该对象马上就要被 main() 覆盖掉）。
     """
     if args.mode == "vscode":
         exts = [e.strip() for e in args.ext.split(",") if e.strip()]
@@ -126,7 +131,7 @@ def _build_mode(args):
                 print(f'  "{k}": {json.dumps(v)},   # 否则{why}')
             raise SystemExit(1)
         return mode, targets
-    return SingleFileMode(None), None
+    return None, None
 
 
 def main(argv=None):
@@ -206,8 +211,11 @@ def main(argv=None):
           f"speed={cfg.speed_multiplier}x "
           f"kill_hotkey={cfg.kill_hotkey.upper()}")
     print(f"source: {source_desc}")
-    for w in typer_mode.editor_warnings():
-        print(f"WARNING: {w}")
+    # typer_mode 在两条分支里都已被赋成具体模式（notepad 在上面构造，
+    # vscode 由 _build_mode 返回），这里统一提示各自的风险。
+    if typer.mode is not None:
+        for w in typer.mode.editor_warnings():
+            print(f"WARNING: {w}")
     print(f"preset: {args.preset} ({describe(args.preset)}, "
           f"{overridden} fields)")
     if not cfg.dry_run:
