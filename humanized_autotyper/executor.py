@@ -331,6 +331,16 @@ class Executor:
         self.tap_combo([self._Key.escape] if self._Key else [],
                        label="escape")
 
+    def key_select_all(self):
+        """Ctrl+A（全选）。
+
+        VSCode 模式靠它清空文档：Quick Open 只是**切换**标签页，不清空的话
+        新内容会插到旧内容中间，而内存缓冲区是从空的开始的——两边就此错位。
+        """
+        keys = self._ctrl_key("a")
+        if keys is not None:
+            self.tap_combo(keys, label="ctrl+a")
+
     def key_save(self):
         """Ctrl+S。"""
         keys = self._ctrl_key("s")

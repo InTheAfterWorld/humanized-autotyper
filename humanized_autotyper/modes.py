@@ -317,11 +317,16 @@ class VSCodeMode(Mode):
 
     # ------------------------------------------------------ 定位 / 存盘 / 校验
     def before_type(self, target: Target, typer) -> None:
-        """Ctrl+P 打开目标文件，并把文档清空到起始状态。
+        """Ctrl+P 打开目标文件，然后把文档清空到起始状态。
 
-        清空是必须的：Quick Open 只是**切换**到已打开的标签页，光标还停在
-        上次的位置，文档里也留着上次的内容。若不清空，打出来的文本会插到
-        旧内容中间。
+        清空这一步不可省：Quick Open 只是**切换**到已打开的标签页，光标还停在
+        上次的位置、文档里也留着上次的内容。而 `AutoTyper` 每个文件都从空的
+        `Buffer("")` 起步（见 machine._reset_for_target），不清空的话打出来的
+        文本会插到旧内容中间，缓冲区与文档从此错位，且回读校验只会报一个
+        语焉不详的"长度不同"。
+
+        全程只依赖 Ctrl+A / Delete 两个按键，不依赖光标当前位置——这比"移动到
+        文末再逐行删"可靠得多（后者在文件很大时要发上千次按键）。
         """
         ex = typer.executor
         if getattr(typer.cfg, "dry_run", True):
@@ -342,15 +347,33 @@ class VSCodeMode(Mode):
         ex._tap_special("return")
         typer._sleep(self.open_settle_s, active=False)
 
+        # --- 清空文档 ---
+        ex.key_select_all()
+        typer._sleep(self.open_settle_s / 2, active=False)
+        ex.delete_key()                  # 删掉选区；文件本就为空时是无害的空操作
+        typer._sleep(self.open_settle_s / 2, active=False)
+        # 光标现在位于文档开头 = 缓冲区起点，两边对齐。
+        # 不做断言：此时读不到屏幕，无法证明 VSCode 真的清干净了；
+        # 真正的确认在 after_type() 的存盘回读。
+        typer.logger.log("FILE", "cleared", target.path, 0)
+
     def after_type(self, target: Target, typer) -> Dict[str, Any]:
-        """Ctrl+S 存盘，等格式化落盘，然后回读磁盘做权威比对。"""
+        """Ctrl+S 存盘，等格式化落盘，然后回读磁盘做权威比对。
+
+        dry-run 下**不能**做这个比对：target.content 本身就是从 abs_path 读
+        出来的，中间没写过任何东西，比对必然相等——那是个恒真式，会让人误以为
+        "dry-run 验证过了"。所以这里如实返回 ok=None（未校验），由调用方区分。
+        """
         ex = typer.executor
-        if not getattr(typer.cfg, "dry_run", True):
-            ex.key_save()
-            typer._sleep(self.save_settle_s, active=False)
+        if getattr(typer.cfg, "dry_run", True):
+            return {"ok": None, "verified": False,
+                    "detail": "dry-run 未发键，未做磁盘校验"}
+        ex.key_save()
+        typer._sleep(self.save_settle_s, active=False)
         actual = self._read_back(target)
         if actual is None:
-            return {"ok": False, "detail": "存盘后读不回文件（可能路径不对）"}
+            return {"ok": False, "verified": True,
+                    "detail": "存盘后读不回文件（可能路径不对）"}
         return self._diff(target.content, actual, target.path)
 
     def _read_back(self, target: Target) -> Optional[str]:

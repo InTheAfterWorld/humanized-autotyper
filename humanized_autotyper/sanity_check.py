@@ -1127,6 +1127,16 @@ def test_vscode_preflight_blocks_bad_setup():
     print("PASS vscode_preflight_blocks_bad_setup")
 
 
+class _NullLogger:
+    """只提供 log() 的空壳：给 after_type/before_type 的替身 typer 用。"""
+
+    def __init__(self):
+        self.lines = []
+
+    def log(self, state, event, detail="", delay=0.0):
+        self.lines.append((state, event, detail))
+
+
 def test_vscode_verify_reports_diff():
     """回读校验必须报出**第一个差异的行号**，否则多文件场景无法排查。"""
     from .modes import VSCodeMode
@@ -1181,12 +1191,21 @@ def test_vscode_reread_matches_disk():
         class FakeTyper:
             pass
         ty = FakeTyper()
-        ty.cfg = fast_cfg()               # dry_run=True -> 不发 Ctrl+S
-        ty.executor = None
+        # 必须 dry_run=False：dry-run 下 after_type 不做比对（恒真式，见实现）
+        ty.cfg = fast_cfg(dry_run=False)
+        sent = []
 
-        # 磁盘内容 == 期望 -> 通过
+        class FakeExec:
+            def key_save(self):
+                sent.append("ctrl+s")
+        ty.executor = FakeExec()
+        ty._sleep = lambda *a, **k: None
+        ty.logger = _NullLogger()
+
+        # 磁盘内容 == 期望 -> 通过，且确实发了 Ctrl+S
         res = m.after_type(t, ty)
         assert res["ok"] is True, res
+        assert sent == ["ctrl+s"], f"live 下必须存盘: {sent}"
 
         # 磁盘被改坏 -> 必须抓到，且指出行号
         with open(path, "w", encoding="utf-8", newline="") as f:
@@ -1231,12 +1250,129 @@ def test_vscode_strips_bom():
         from .modes import Target
         m2 = VSCodeMode(d, settings_paths=[], save_settle_s=0.0)
         ty = type("T", (), {})()
-        ty.cfg = fast_cfg()
-        ty.executor = None
+        ty.cfg = fast_cfg(dry_run=False)
+
+        class FakeExec:
+            def key_save(self):
+                pass
+        ty.executor = FakeExec()
+        ty._sleep = lambda *a, **k: None
+        ty.logger = _NullLogger()
         res = m2.after_type(Target(path="bom.py", content="print('x')\n",
                                   abs_path=p), ty)
         assert res["ok"] is True, res
     print("PASS vscode_strips_bom")
+
+
+def test_vscode_before_type_clears_document():
+    """回归：打开文件后必须清空文档。
+
+    Quick Open 只是**切换**标签页，文档里还留着上次的内容；而每个文件的
+    Buffer 是从空的起步的。不清空就会把新文本插到旧内容中间。
+
+    这里锁定按下的**顺序**必须完整且正确：
+    Ctrl+P -> 路径 -> Enter -> Ctrl+A -> Delete
+    """
+    from .modes import VSCodeMode, Target
+
+    events = []
+
+    class FakeExec:
+        def key_quick_open(self):     events.append(("combo", "ctrl+p"))
+        def key_select_all(self):     events.append(("combo", "ctrl+a"))
+        def key_save(self):           events.append(("combo", "ctrl+s"))
+        def type_char(self, ch, d=0.0, hold=None):
+            events.append(("char", ch))
+        def _tap_special(self, name, hold=None):
+            events.append(("tap", name))
+        def delete_key(self):         events.append(("key", "delete"))
+
+    class FakeLogger:
+        def log(self, state, event, detail="", delay=0.0):
+            events.append(("log", f"{state}/{event}"))
+
+    class FakeTyper:
+        cfg = type("C", (), {"dry_run": False})()
+        executor = FakeExec()
+        logger = FakeLogger()
+
+        def _sleep(self, s, active=True, chunk=0.25):
+            events.append(("sleep", round(s, 3)))
+
+    m = VSCodeMode("proj", settings_paths=[], open_settle_s=0.6)
+    m.before_type(Target(path="sub/a.py", content="x"), FakeTyper())
+
+    seq = [e for e in events if e[0] in ("combo", "key", "tap")]
+    assert seq[0] == ("combo", "ctrl+p"), f"必须先开 Quick Open: {seq}"
+    assert seq[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
+        f"结尾必须是 Ctrl+A + Delete 清空: {seq}"
+    assert ("tap", "return") in seq, f"敲完路径要按 Enter: {seq}"
+    # Enter 必须在清空之前
+    i_enter = seq.index(("tap", "return"))
+    i_clear = seq.index(("combo", "ctrl+a"))
+    assert i_enter < i_clear, f"先打开文件再清空: {seq}"
+    # 路径逐字符输入，且用的是相对 src_dir 的正斜杠路径
+    typed = "".join(c for kind, c in events if kind == "char")
+    assert typed == "sub/a.py", f"路径输入不对: {typed!r}"
+    assert ("log", "FILE/cleared") in events, "应记录清空动作以便审计"
+
+    # rel_prefix 存在时要带前缀（src_dir 不在工作区根目录的情形）
+    events.clear()
+    m2 = VSCodeMode("proj", settings_paths=[], open_settle_s=0.1,
+                    rel_prefix="myrepo")
+    m2.before_type(Target(path="a.py", content="x"), FakeTyper())
+    typed2 = "".join(c for kind, c in events if kind == "char")
+    assert typed2 == "myrepo/a.py", typed2
+
+    # dry-run 必须一发键都不发
+    events.clear()
+
+    class DryTyper(FakeTyper):
+        cfg = type("C", (), {"dry_run": True})()
+    m3 = VSCodeMode("proj", settings_paths=[])
+    m3.before_type(Target(path="a.py", content="x"), DryTyper())
+    assert events == [], f"dry-run 不该发键: {events}"
+    print("PASS vscode_before_type_clears_document")
+
+
+def test_vscode_dry_run_does_not_fake_verification():
+    """回归：dry-run 下 after_type 必须报「未校验」，不能报通过。
+
+    target.content 本身就是从 abs_path 读出来的，中间没写过任何东西，
+    比对必然相等——那是个恒真式。若报 ok=True，用户会误以为 dry-run
+    验证过文件没问题，实际上一根键都没发。
+    """
+    from .modes import VSCodeMode, Target
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "dry.py")
+        content = "x = 1\n"
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+        m = VSCodeMode(d, settings_paths=[])
+        t = Target(path="dry.py", content=content, abs_path=path)
+
+        ty = type("T", (), {})()
+        ty.cfg = fast_cfg()                  # dry_run=True
+        ty.executor = None
+        res = m.after_type(t, ty)
+        assert res["ok"] is None, \
+            f"dry-run 不该报通过（恒真式）: {res}"
+        assert res["verified"] is False
+        assert "未做磁盘校验" in res["detail"]
+
+    # 汇总层也要区分：未校验不能算通过
+    assert s_files_ok_ignores_unverified()
+    print("PASS vscode_dry_run_does_not_fake_verification")
+
+
+def s_files_ok_ignores_unverified():
+    """files_ok 只数 ok is True；ok=None（未校验）不得混入成功数。"""
+    per_file = [{"ok": True}, {"ok": None}, {"ok": False}]
+    ok = sum(1 for f in per_file if f["ok"] is True)
+    unver = sum(1 for f in per_file if f["ok"] is None)
+    assert (ok, unver) == (1, 1), (ok, unver)
+    return True
 
 
 def main():
@@ -1280,6 +1416,8 @@ def main():
     test_vscode_verify_reports_diff()
     test_vscode_reread_matches_disk()
     test_vscode_strips_bom()
+    test_vscode_before_type_clears_document()
+    test_vscode_dry_run_does_not_fake_verification()
     print("ALL SANITY CHECKS PASSED")
 
 

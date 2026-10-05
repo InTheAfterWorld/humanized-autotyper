@@ -195,8 +195,10 @@ class AutoTyper:
                 except Exception as exc:
                     result = {"ok": False, "error": f"校验失败: {exc}"}
                 total_chars += self.stats["chars"]
+                # ok 可能是 None（模式声明本次未做校验，例如 dry-run 下的
+                # VSCode 回读是恒真式）——不能当成失败。
                 per_file.append({"path": target.path,
-                                 "ok": bool(result.get("ok")),
+                                 "ok": result.get("ok"),
                                  "detail": result.get("detail", ""),
                                  "chars": self.stats["chars"]})
         finally:
@@ -205,7 +207,10 @@ class AutoTyper:
         summary = dict(self.stats)
         summary["chars"] = total_chars
         summary["files"] = len(targets)
-        summary["files_ok"] = sum(1 for f in per_file if f["ok"])
+        summary["files_ok"] = sum(1 for f in per_file if f["ok"] is True)
+        # 未校验（ok=None）与失败（ok=False）必须分开报，否则会误导排查方向
+        summary["files_unverified"] = sum(1 for f in per_file
+                                          if f["ok"] is None)
         summary["per_file"] = per_file
         summary["elapsed_s"] = round(elapsed, 1)
         summary["killed"] = self.kill.killed()

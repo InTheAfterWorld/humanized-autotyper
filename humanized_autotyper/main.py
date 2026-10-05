@@ -236,7 +236,10 @@ def main(argv=None):
             # 逐文件结论单独列：多文件场景下 bool 汇总没有排查价值
             print(f"per_file ({len(v)}):")
             for f in v:
-                mark = "OK  " if f.get("ok") else "FAIL"
+                ok = f.get("ok")
+                # 三态：True 通过 / False 失败 / None 未校验
+                mark = "OK  " if ok is True else ("SKIP" if ok is None
+                                                 else "FAIL")
                 print(f"  [{mark}] {f.get('path')}  {f.get('detail', '')}")
             continue
         print(f"{k}: {v}")
