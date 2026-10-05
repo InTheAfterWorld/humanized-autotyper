@@ -1,0 +1,21 @@
+{
+ "delay_mu": 110.0,
+ "delay_ln_sigma": 0.4,
+ "p_burst_enter": 5.0,
+ "p_typo": 1.2,
+ "typo_autocorr_window": 10.0,
+ "fatigue_rate": 0.5,
+ "p_backspace_burst": 0.8,
+ "p_pause_short": 0.8,
+ "pause_clip_hi": 10.0,
+ "long_pause_xmin": 4.0,
+ "long_pause_cap": 35.0,
+ "p_edit_previous": 0.4,
+ "edit_min_gap_s": 90.0,
+ "p_rewrite_chunk": 0.6,
+ "speed_multiplier": 1.0,
+ "_preset": "标准",
+ "_countdown": 5,
+ "_long_on": true,
+ "_window": ""
+}

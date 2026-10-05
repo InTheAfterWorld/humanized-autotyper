@@ -1,0 +1,887 @@
+import os
+import random
+import time
+from typing import Any, Dict
+
+from .config import Config
+from .buffer import Buffer
+from .delays import DelayModel
+from .keymap import unsupported_chars, dyad_factor, FINGER
+from .typos import TypoEngine, is_typoable
+from .machine import AutoTyper
+from .main import DEMO_SOURCE, source_problem
+
+
+def test_buffer():
+    b = Buffer("hello\nworld")
+    for ch in "!!!":
+        b.type_char(ch)
+    assert b.text == "hello\nworld!!!" and b.cursor == 14
+    b.backspace()
+    assert b.text == "hello\nworld!!" and b.cursor == 13
+    b.to_line_start()
+    assert b.line_col() == (1, 0)
+    b.apply_up(1)
+    assert b.line_col() == (0, 0)
+    b.move_right(3)
+    assert b.seg(b.cursor - 3, b.cursor) == "hel"
+    assert b.complete_line_count() == 1 and b.line_count() == 2
+    assert b.line_end_excl_newline(0) == 5
+    ws = Buffer("def foo_bar(x):\n    return x").words_on_line(0)
+    assert "foo_bar" in [w[2] for w in ws]
+    print("PASS buffer")
+
+
+def test_delays():
+    cfg = Config()
+    rng = random.Random(1)
+    dm = DelayModel(cfg, rng)
+    s = sorted(dm.sample("", "a") for _ in range(5000))
+    med, p95 = s[2500], s[4750]
+    assert 0.07 <= med <= 0.16 and p95 <= cfg.delay_clip[1]
+    d_nl = sum(dm.sample("\n", "a") for _ in range(500)) / 500
+    d_rep = sum(dm.sample("a", "a") for _ in range(500)) / 500
+    assert d_nl > med * 1.8
+    ps = sorted(dm.pause_short() for _ in range(2000))
+    assert cfg.pause_short_clip[0] <= ps[0] + 1e-9 <= ps[-1] <= cfg.pause_short_clip[1] + 1e-9
+    lp = sorted(dm.long_pause() for _ in range(2000))
+    assert lp[-1] <= cfg.long_pause_cap + 1e-9 and lp[1000] >= cfg.long_pause_xmin
+    dm.add_active(600)
+    assert dm._fatigue() > 1.0
+    dm.note_pause(10)
+    assert dm.warmup_left == cfg.warmup_chars
+    print(f"PASS delays median={med*1000:.0f}ms p95={p95*1000:.0f}ms "
+          f"afterNL={d_nl*1000:.0f}ms repeat={d_rep*1000:.0f}ms")
+
+
+def test_typos():
+    cfg = Config()
+    rng = random.Random(2)
+    te = TypoEngine(cfg, rng)
+    kinds = {}
+    n = 4000
+    for _ in range(n):
+        r = te.roll("d", next_char="x")
+        if r:
+            assert r["kind"] in ("adjacent", "double", "transposition", "random")
+            kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+    rate = sum(kinds.values()) / n
+    assert 0.004 <= rate <= 0.03 and kinds.get("transposition", 0) > 0
+    assert te.roll("\n", next_char=None) is None
+    print(f"PASS typos rate={rate:.3f} kinds={kinds}")
+
+
+def fast_cfg(**over):
+    # 标注成 Dict[str, Any]：dict(...) 的字面量值类型会被推成
+    # float | tuple | str 的联合，再展开进 Config(**base) 时每个字段都被判
+    # 不匹配（一次报 60+ 个错）。这些 override 本来就是任意 Config 字段。
+    base: Dict[str, Any] = dict(
+        dry_run=True, speed_multiplier=300.0, countdown_seconds=0,
+        line_end_think_prob=0.02, pause_short_ln_mu=-4.6,
+        pause_short_clip=(0.002, 0.01), long_pause_cap=0.4,
+        edit_min_gap_s=0.0, p_edit_previous=0.06, p_rewrite_chunk=0.06,
+        log_file=os.devnull,
+    )
+    base.update(over)
+    return Config(**base)
+
+
+def test_full_dry_run():
+    cfg = fast_cfg()
+    t0 = time.time()
+    typer = AutoTyper(cfg, DEMO_SOURCE, rng=random.Random(42))
+    typer.sched.threshold = 0.05
+    s = typer.run()
+    took = time.time() - t0
+    assert s["final_matches_source"], "BUFFER != SOURCE after full run"
+    assert s["source_consumed"] == len(DEMO_SOURCE)
+    assert s["errors"] > 0 and s["corrections"] > 0
+    assert s["long_pauses"] >= 1
+    assert took < 120
+    print(f"PASS full_dry_run {s} in {took:.1f}s")
+
+
+def _primed_typer(cfg, upto):
+    typer = AutoTyper(cfg, DEMO_SOURCE, rng=random.Random(7))
+    typer.buffer.text = DEMO_SOURCE[:upto]
+    typer.buffer.cursor = upto
+    typer.pipeline.i = upto
+    typer.last_sent = DEMO_SOURCE[upto - 1] if upto else ""
+    return typer
+
+
+def test_edit_previous_unit():
+    cfg = fast_cfg()
+    for upto in (300, 500, 700):
+        t = _primed_typer(cfg, upto)
+        before = t.buffer.text
+        fired = False
+        for _ in range(30):
+            t.last_edit_time = -1e18
+            t._h_edit_previous()
+            if t.stats["edits"] > 0:
+                fired = True
+                break
+        assert fired, f"edit never fired at upto={upto}"
+        assert t.buffer.text == before, "EDIT_PREVIOUS changed committed text"
+        assert t.buffer.cursor == len(before), "cursor not at doc end after edit"
+        assert t.err_detect_in < 0
+    print("PASS edit_previous_unit")
+
+
+def test_rewrite_chunk_unit():
+    cfg = fast_cfg()
+    for upto in (400, 700):
+        t = _primed_typer(cfg, upto)
+        before = t.buffer.text
+        t._h_rewrite_chunk()
+        assert t.buffer.text == before, "REWRITE_CHUNK changed committed text"
+        assert t.buffer.cursor == len(before)
+        assert t.stats["rewrites"] >= 1
+    print("PASS rewrite_chunk_unit")
+
+
+def test_burst_unit():
+    cfg = fast_cfg()
+    t = _primed_typer(cfg, 500)
+    # 光标必须落在行中间：行首只剩 1 个字符时爆发本来就删不动
+    t.buffer.text = "x" * 40
+    t.buffer.cursor = 40
+    before = t.buffer.text
+    t._h_burst()
+    assert t.stats["bursts"] == 1
+    assert t.buffer.text == before, "BACKSPACE_BURST changed text net effect"
+    print("PASS burst_unit")
+
+
+def test_pause_long_unit():
+    cfg = fast_cfg()
+    t = _primed_typer(cfg, 400)
+    before = t.buffer.text
+    cur_before = t.buffer.cursor
+    t.delays.reset_fatigue()
+    t.sched.active = 999.0
+    r = t._h_pause_long()
+    assert r == "TYPING"
+    assert t.buffer.text == before and t.buffer.cursor == cur_before
+    assert t.sched.active < 0.5
+    print("PASS pause_long_unit")
+
+
+class NavRecorder:
+    """只记录方向键次数，不发送任何按键。"""
+    def __init__(self):
+        self.taps = []
+
+    def nav_left(self, n=1):
+        self.taps.append(("left", n))
+
+    def nav_right(self, n=1):
+        self.taps.append(("right", n))
+
+    def nav_up(self, n=1):
+        self.taps.append(("up", n))
+
+    def nav_down(self, n=1):
+        self.taps.append(("down", n))
+
+
+def test_pause_long_ritual_clamped():
+    """光标在文首附近时，"左 N 再右 N"的找回位置动作不能超过已打字符数：
+    超出部分会被编辑器在文档头夹住，回程就冲过头，光标与缓冲区错位。"""
+    cfg = fast_cfg()
+    cfg.resume_left_range = (60, 60)
+    cfg.long_pause_xmin = cfg.long_pause_cap = 1.0
+    for upto in (0, 10, 30, 200):
+        t = _primed_typer(cfg, upto)
+        rec = NavRecorder()
+        t.executor = rec
+        t.sched.active = 1e9
+        before = t.buffer.text
+        t._h_pause_long()
+        left = sum(n for k, n in rec.taps if k == "left")
+        right = sum(n for k, n in rec.taps if k == "right")
+        assert left == right, f"左移/右移不对称: {left} vs {right}"
+        assert left <= upto, f"左移 {left} 次 > 已打 {upto} 字符"
+        assert t.buffer.text == before and t.buffer.cursor == len(before)
+    print("PASS pause_long_ritual_clamped")
+
+
+def test_burst_no_fake_count():
+    """行首只剩 1 个字符时删不动，这种"没发生的爆发"不能计入统计。"""
+    cfg = fast_cfg()
+    t = AutoTyper(cfg, DEMO_SOURCE, rng=random.Random(3))
+    t.buffer.text = "a"
+    t.buffer.cursor = 1
+    t.pipeline.i = 1
+    for _ in range(20):
+        t._h_burst()
+    assert t.stats["bursts"] == 0 and t.buffer.text == "a"
+    print("PASS burst_no_fake_count")
+
+
+def test_transposition_payload():
+    """换序错误的返回结构必须自洽：先打后一个字符，再打当前字符。"""
+    te = TypoEngine(Config(), random.Random(3))
+    for _ in range(20000):
+        r = te.roll("d", next_char="x")
+        if r and r["kind"] == "transposition":
+            assert r["emit_first"] == "x", r
+            assert r["emit_second"] == "d", r
+            assert r["typed_len"] == 2, r
+            break
+    else:
+        raise AssertionError("20000 次都没抽到 transposition")
+    print("PASS transposition_payload")
+
+
+def test_kill_mid_edit_keeps_text():
+    """停止请求正好落在"已删除、还没重打"之间时，文档不能缺字。"""
+    cfg = fast_cfg()
+    for upto in (300, 500, 700):
+        t = _primed_typer(cfg, upto)
+        before = t.buffer.text
+        ex = t.executor
+        orig_select = ex.select_shift_right
+
+        def kill_on_select(n=1, _t=t, _orig=orig_select):
+            _t.kill.set()          # 模拟停止请求恰好在这时到达
+            return _orig(n)
+
+        ex.select_shift_right = kill_on_select
+        for _ in range(30):
+            # 抽中的目标行可能没有可改的单词，那就再抽一次
+            t.last_edit_time = -1e18
+            t._h_edit_previous()
+            if t.kill.killed():
+                break
+        t._flush_correction()
+        assert t.kill.killed(), f"没走到删除路径 (upto={upto})"
+        assert t.buffer.text == before, f"停止时删掉的片段没补回来 (upto={upto})"
+    print("PASS kill_mid_edit_keeps_text")
+
+
+def test_kill_mid_burst_keeps_text():
+    """回删爆发中途收到停止请求：已删的片段必须补回。"""
+    cfg = fast_cfg()
+    t = _primed_typer(cfg, 500)
+    t.buffer.text = "x" * 40        # 光标在行中，爆发才有得删
+    t.buffer.cursor = 40
+    before = t.buffer.text
+    ex = t.executor
+    orig_backspace = ex.backspace
+    calls = {"n": 0}
+
+    def backspace(_t=t):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            _t.kill.set()
+        return orig_backspace()
+
+    ex.backspace = backspace
+    t._h_burst()
+    assert t.stats["bursts"] == 1
+    assert t.buffer.text == before, "回删爆发被停止后没有补回文本"
+    print("PASS kill_mid_burst_keeps_text")
+
+
+def test_dyad_rhythm():
+    """二元节奏：同指连击应明显慢于双手交替，且与"键位相邻"无关。"""
+    import statistics
+
+    # 确定性部分：查表本身
+    assert dyad_factor("e", "d", 1.35, 0.85) == 1.35      # 同指（左中指列）
+    assert dyad_factor("y", "h", 1.35, 0.85) == 1.35      # 同指（右食指，同行）
+    assert dyad_factor("w", "e", 1.35, 0.85) == 1.0       # 同手异指
+    assert dyad_factor("a", "j", 1.35, 0.85) == 0.85      # 双手交替
+    assert dyad_factor("a", "a", 1.35, 0.85) is None      # 同键交给 factor_repeat
+    # 关键回归保护：w 与 s 同指（字母行是每指一竖列），不能因为"键位相邻"被当成同手异指
+    assert FINGER["w"] == FINGER["s"] and dyad_factor("w", "s", 1.35, 0.85) == 1.35
+    assert dyad_factor("a", "1", 1.35, 0.85) is None      # 非字母不参与
+
+    # 集成部分：延迟采样确实吃进了这个因子（用中位数抗长尾）
+    cfg = Config()
+    dm = DelayModel(cfg, random.Random(11))
+    same = statistics.median(dm.sample("e", "d") for _ in range(400))
+    alt = statistics.median(dm.sample("a", "j") for _ in range(400))
+    assert same > alt * 1.2, f"同指未变慢: {same:.4f} vs {alt:.4f}"
+    print(f"PASS dyad_rhythm same_finger={same*1000:.0f}ms "
+          f"alt_hand={alt*1000:.0f}ms ratio={same/alt:.2f}")
+
+
+def test_typo_speed_coupling():
+    """错误率必须与局部速度耦合：打得越快(tempo 越小)越容易出错。"""
+    cfg = Config()
+    n = 12000
+
+    def count(tempo):
+        te = TypoEngine(cfg, random.Random(5))
+        return sum(1 for _ in range(n)
+                   if te.roll("d", next_char="x", tempo_factor=tempo))
+
+    fast, slow = count(0.85), count(1.35)      # 0.85=突发段那种快, 1.35=同指卡顿那种慢
+    assert fast > slow * 1.3, f"耦合不足: 快={fast} 慢={slow}"
+    # 默认 tempo=1.0 时应与耦合前完全一致
+    te = TypoEngine(cfg, random.Random(6))
+    hits = sum(1 for _ in range(n) if te.roll("d", next_char="x"))
+    assert 0.004 <= hits / n <= 0.03, hits / n
+
+    # 端到端：真实文本上的 tempo 分布决定了整体乘数（含突发段的 0.55）。
+    # 实测均值 ≈1.18 —— 锁住它，免得以后改突发参数时错误率静默漂移。
+    dm = DelayModel(cfg, random.Random(3))
+    src = "def compute_stats(numbers):\n    total = 0\n    return total\n" * 40
+    prev, mult = "", []
+    for ch in src:
+        dm.sample(prev, ch)
+        mult.append(dm.tempo_factor ** (-cfg.typo_speed_exponent))
+        prev = ch
+    mean_mult = sum(mult) / len(mult)
+    assert 1.0 <= mean_mult <= 1.4, f"错误率乘数漂移: {mean_mult:.3f}"
+    print(f"PASS typo_speed_coupling fast={100*fast/n:.2f}% slow={100*slow/n:.2f}% "
+          f"ratio={fast/slow:.2f} (tempo=1.0 -> {100*hits/n:.2f}%, "
+          f"端到端乘数={mean_mult:.2f})")
+
+
+def test_review_keeps_text():
+    """回读遍数只读不改：文本与光标必须原样，且确实回扫又回到文末。"""
+    cfg = fast_cfg()
+    cfg.review_back_range = (20, 20)
+    for upto in (300, 500, 700):
+        t = _primed_typer(cfg, upto)
+        t._sleep = lambda seconds, active=True, chunk=0.25: True   # 不真的睡
+        before, cursor_before = t.buffer.text, t.buffer.cursor
+        path = []
+        real_nav = t._navigate_to
+        t._navigate_to = lambda pos, _r=real_nav: (path.append(pos), _r(pos))[1]
+        r = t._h_review()
+        assert r == "TYPING"
+        assert t.buffer.text == before, "REVIEW 改动了文本"
+        assert t.buffer.cursor == cursor_before, "REVIEW 结束后光标没回到文末"
+        assert t.stats["reviews"] == 1
+        # 绝对位置轨迹：必须往回走至少 20 格，最后回到原位
+        assert path, "REVIEW 没有做任何导航"
+        assert path[-1] == cursor_before, f"没有回到文末: {path}"
+        assert cursor_before - min(path) >= 20, f"回扫深度不足: {path}"
+    print("PASS review_keeps_text")
+
+
+def test_review_mid_correction_is_safe():
+    """REVIEW 恰好插在"错字已发现、还没纠正"的窗口里时，不得破坏纠正状态。"""
+    cfg = fast_cfg()
+    cfg.review_back_range = (10, 10)
+    t = _primed_typer(cfg, 500)
+    t._sleep = lambda seconds, active=True, chunk=0.25: True
+    # 伪造一个待补的错字：本该打 'x'，实际打成了 'd'
+    t.err_typed, t.err_intended, t.err_detect_in = "d", "x", 1
+    before, cursor_before = t.buffer.text, t.buffer.cursor
+    t._h_review()
+    assert t.err_typed == "d" and t.err_intended == "x"
+    assert t.err_detect_in == 1, "REVIEW 破坏了待纠正状态"
+    assert t.buffer.text == before and t.buffer.cursor == cursor_before
+    t._flush_correction()          # 纠正必须仍然能正常收口
+    # 纠正 = 退掉 err_typed 的字符数、再打上 err_intended，所以文本会变，
+    # 但必须恰好"换掉一个字符"：即末尾变成本该打的 'x'，长度不变。
+    assert t.err_detect_in < 0 and t.err_typed == ""
+    assert t.buffer.text[-1] == "x", f"纠正结果不对: {t.buffer.text[-8:]!r}"
+    assert len(t.buffer.text) == len(before), "纠正后长度不该变"
+    print("PASS review_mid_correction_is_safe")
+
+
+def test_review_disabled_is_inert():
+    """p_review=0 时不该产生回读事件（并且不破坏任何东西）。"""
+    cfg = fast_cfg()
+    cfg.p_review = 0.0
+    t = _primed_typer(cfg, 500)
+    t.sched.threshold = 1e18        # 排除长暂停干扰
+    src = DEMO_SOURCE[:500]
+    t2 = AutoTyper(cfg, src, rng=random.Random(4))
+    t2.sched.threshold = 1e18
+    s = t2.run()
+    assert s["reviews"] == 0, f"p_review=0 仍有 {s['reviews']} 次回读"
+    assert s["final_matches_source"]
+    print("PASS review_disabled_is_inert")
+
+
+def _fake_windll(title):
+    """伪造 ctypes.windll.user32，让 check_window 拿到指定的前台窗口标题。"""
+    import ctypes
+    import types
+
+    class _Buf:
+        def __init__(self):
+            self.value = ""
+
+    class _User32:
+        def GetForegroundWindow(self):
+            return 1
+
+        def GetWindowTextW(self, hwnd, buf, n):
+            buf.value = title
+
+    return types.SimpleNamespace(user32=_User32())
+
+
+def _window_probe(expected):
+    """构造一个只用来测 check_window 的 Executor（不碰 pynput）。"""
+    from .executor import Executor, Logger, Killer
+
+    cfg = Config(dry_run=False, expected_window_title=expected,
+                 log_file=os.devnull)
+    ex = Executor.__new__(Executor)
+    ex.cfg = cfg
+    ex.kill = Killer()
+    ex.live = True
+    ex._warned_mismatch = False
+    # 必须叫 log（与 __init__ 一致）。原来这里写 ex.logger，恰好把
+    # check_window() 里 self.logger 的笔误掩盖住了——属性名不对，
+    # 而这个夹具"碰巧"补上了同名属性，所以测试一直是绿的。
+    ex.log = Logger(cfg)
+    return ex
+
+
+def test_check_window_pauses_not_kills():
+    """失焦 = 暂停（可恢复），不再是"切走一次就彻底放弃"。"""
+    import ctypes
+
+    ex = _window_probe("Notepad")
+    real = getattr(ctypes, "windll", None)
+    try:
+        ctypes.windll = _fake_windll("Untitled - Notepad")
+        assert ex.check_window() is True
+        assert not ex.kill.paused() and not ex.kill.killed()
+
+        ctypes.windll = _fake_windll("WhatsApp")
+        assert ex.check_window() is False, "不匹配应返回 False"
+        assert ex.kill.paused(), "失焦应请求暂停"
+        assert not ex.kill.killed(), "失焦不该直接杀掉任务"
+
+        ctypes.windll = _fake_windll("Untitled - Notepad")
+        assert ex.check_window() is True
+        assert not ex.kill.paused(), "窗口回来后应自动撤销暂停"
+
+        # 读不到标题（句柄失效）也必须暂停，而不是放行
+        ctypes.windll = _fake_windll("")
+        assert ex.check_window() is False and ex.kill.paused()
+    finally:
+        if real is not None:
+            ctypes.windll = real
+    print("PASS check_window_pauses_not_kills")
+
+
+def test_send_guard_blocks_keystroke_while_paused():
+    """竞态兜底：_send 遇到暂停标志必须先等恢复，再发键。
+
+    端到端测试（下面那个）在概念上无法断言"零击键"——暂停请求来自另一个
+    线程，总可能正好落在某次循环中间。这里确定性地构造那个窗口。
+    """
+    import threading as _th
+
+    cfg = fast_cfg()
+    t = _primed_typer(cfg, 400)
+    log = []
+
+    def spy(ch, delay_ms=0.0, hold=None):
+        log.append((ch, t.kill.paused()))     # 记录"发键那一刻是否仍在暂停"
+
+    t.executor.type_char = spy
+    t.kill.request_pause()
+    _th.Timer(0.15, t.kill.request_resume).start()
+    started = time.time()
+    t._send("Z")
+
+    assert log, "恢复后没有发键"
+    assert not log[0][1], "暂停未解除就发了击键"
+    assert time.time() - started >= 0.1, "没有真的等过暂停"
+    assert t.buffer.text == DEMO_SOURCE[:400] + "Z"
+    print(f"PASS send_guard_blocks_keystroke_while_paused "
+          f"(waited {time.time()-started:.2f}s)")
+
+    # 被停止时不该补发
+    t2 = _primed_typer(cfg, 400)
+    sent = []
+    t2.executor.type_char = lambda ch, delay_ms=0.0, hold=None: sent.append(ch)
+    t2.kill.request_pause()
+    t2.kill.set()
+    t2._send("Y")
+    assert sent == [], "已被停止时不该补发击键"
+    assert t2.buffer.text == DEMO_SOURCE[:400]
+
+
+def test_pause_blocks_typing_and_resumes():
+    """暂停期间一个键都不发；恢复后跑完且文本一致。"""
+    import threading as _th
+
+    cfg = fast_cfg()
+    typer = AutoTyper(cfg, DEMO_SOURCE * 2, rng=random.Random(21))
+    typer.sched.threshold = 1e18
+    stats = {"pause_seen": False}
+    emitted_while_paused = []
+    # 插桩必须放在"真正发出击键"的那一层。放在 _send 入口会误报：_send 入口
+    # 早于 _wait_while_paused，暂停恰好在等待期间到达也会被记成一次违规。
+    real_type_char = typer.executor.type_char
+
+    def spied_type_char(ch, delay_ms=0.0, hold=None):
+        if typer.kill.paused():
+            emitted_while_paused.append(ch)
+        return real_type_char(ch, delay_ms, hold)
+
+    typer.executor.type_char = spied_type_char
+
+    def watch():
+        for _ in range(600):
+            if typer.kill.paused():
+                stats["pause_seen"] = True
+                return
+            time.sleep(0.005)
+
+    w = _th.Thread(target=watch, daemon=True)
+    w.start()
+    t0 = _th.Timer(0.15, typer.kill.request_pause)
+    t1 = _th.Timer(0.60, typer.kill.request_resume)
+    t0.start()
+    t1.start()
+    s = typer.run()
+    for t in (t0, t1):
+        t.join()
+    w.join(timeout=4)
+
+    assert stats["pause_seen"], "测试没真正进入过暂停（没等到 paused 状态）"
+    assert not emitted_while_paused, \
+        f"暂停期间发出了 {len(emitted_while_paused)} 次击键: {emitted_while_paused[:8]}"
+    assert s["pause_count"] >= 1, "没有记录到暂停"
+    assert s["final_matches_source"], "暂停恢复后文本不一致"
+    print(f"PASS pause_blocks_typing_and_resumes chars={s['chars']} "
+          f"pauses={s['pause_count']}")
+
+
+def test_pause_during_long_pause_resumes():
+    """长暂停中途暂停：同样不该打字，恢复后计数归零、文本一致。"""
+    import threading as _th
+
+    cfg = fast_cfg()
+    typer = AutoTyper(cfg, DEMO_SOURCE, rng=random.Random(31))
+    typer.sched.threshold = 1e18
+    cfg.long_pause_xmin = cfg.long_pause_cap = 0.6
+    fired = {"n": 0}
+    real = typer._wait_while_paused
+
+    def counting_wait():
+        fired["n"] += 1
+        return real()
+
+    typer._wait_while_paused = counting_wait
+    t = _th.Timer(0.2, typer.kill.request_pause)
+    t2 = _th.Timer(0.5, typer.kill.request_resume)
+    t.start()
+    t2.start()
+    s = typer.run()
+    t.join()
+    t2.join()
+    assert fired["n"] >= 1, "长暂停期间没有进入暂停等待"
+    assert s["final_matches_source"]
+    print(f"PASS pause_during_long_pause_resumes pauses={s['pause_count']}")
+
+
+def test_source_guard():
+    """\r 之类的控制字符必须在启动前就被拒绝（dry-run 也照样拒）。"""
+    assert unsupported_chars("a\nb\tc") == []
+    assert unsupported_chars("a\rb") == [(1, "\r")]
+    assert [i for i, _ in unsupported_chars("x\x00y\x0bz")] == [1, 3]
+    assert source_problem("") is not None
+    assert source_problem("   ") is not None
+    assert source_problem("a\rb") is not None
+    assert source_problem(DEMO_SOURCE) is None
+    print("PASS source_guard")
+
+
+def test_mixed_text_dry_run():
+    """中英混排 + emoji + 制表符：缓冲区必须逐字符等于源文本。"""
+    src = "你好，world！\n\tdef 函数(x):  # 😀 ok?\n" * 8
+    cfg = fast_cfg()
+    t = AutoTyper(cfg, src, rng=random.Random(11))
+    t.sched.threshold = 0.05
+    s = t.run()
+    assert s["final_matches_source"], "中英混排 + emoji 跑完不一致"
+    assert s["source_consumed"] == len(src)
+    print(f"PASS mixed_text_dry_run chars={s['chars']} errors={s['errors']} "
+          f"edits={s['edits']} rewrites={s['rewrites']}")
+
+
+def test_log_run_segmentation():
+    """日志必须按运行分段，且每段带得上自己那次运行的 config。
+
+    回归背景：日志是追加写的，一次 --speed 300 的冒烟跑和一次 1.0x 的正常跑
+    会混在同一个文件里。老 report 把整个文件当一次运行统计，pooled 中位数被
+    拉到 ~67ms、CV 从 0.46 涨到 1.00，看起来像"节奏不稳"，其实只是两批不同
+    速度的样本被硬拼在一起。
+    """
+    import csv as _csv
+    import json as _json
+    import tempfile
+
+    from .executor import Logger
+    from .report import load, split_runs
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "seg.csv")
+
+        # run A: 快档（墙钟 ~0.3ms/字）
+        cfg_a = Config(log_file=path, speed_multiplier=300.0, p_typo=0.012)
+        a = AutoTyper(cfg_a, "hello world\n" * 20, rng=random.Random(1))
+        a.sched.threshold = 1e18
+        sa = a.run()
+        a.logger.close()
+
+        # run B: 慢档（墙钟 ~14ms/字），并且用**不同**的 p_typo
+        cfg_b = Config(log_file=path, speed_multiplier=8.0, p_typo=0.05)
+        b = AutoTyper(cfg_b, "hello world\n" * 20, rng=random.Random(2))
+        b.sched.threshold = 1e18
+        sb = b.run()
+        b.logger.close()
+
+        rows = load(path)
+        runs = split_runs(rows)
+        assert len(runs) == 2, f"应切分成 2 段，实际 {len(runs)}"
+        assert all(r["closed"] for r in runs), "两段都应有 RUN,end 收尾标记"
+        assert runs[0]["run_id"] != runs[1]["run_id"], "两段 run_id 应不同"
+
+        # 每段都要还原出**自己那次**的 config，而不是默认值
+        assert runs[0]["cfg"].speed_multiplier == 300.0
+        assert runs[1]["cfg"].speed_multiplier == 8.0
+        assert runs[0]["cfg"].p_typo == 0.012
+        assert runs[1]["cfg"].p_typo == 0.05
+        # 元组字段经 JSON 往返后必须仍是元组（Config 内部要解包）
+        assert isinstance(runs[0]["cfg"].delay_clip, tuple)
+        assert len(runs[0]["cfg"].delay_clip) == 2
+        assert isinstance(runs[0]["cfg"].typo_weights[0], tuple)
+
+        # 关键：pooled 中位数与分段中位数必须显著不同，否则这个测试没意义
+        def med(rs):
+            d = sorted(float(r["delay_ms"]) for r in rs
+                       if r["event"] == "char" and r["delay_ms"])
+            return d[len(d) // 2]
+
+        m0, m1 = med(runs[0]["rows"]), med(runs[1]["rows"])
+        pooled = med([r for run in runs for r in run["rows"]])
+        assert m1 > m0 * 5, f"两段墙钟中位数应差很多倍（{m0} vs {m1}）"
+        # pooled 中位数落在两段之间（偏向字符数多的那段），所以它**不**等于
+        # 任何一段的真实值 —— 这正是老 report 会报出中间数字的原因。
+        assert m0 < pooled < m1, \
+            f"pooled 中位数应落在两段之间（{m0} < {pooled} < {m1}）"
+        assert min(abs(pooled - m0), abs(pooled - m1)) > 0.2 * (m1 - m0), \
+            "pooled 应明显偏离两段中至少有一段，否则混算失真无从体现"
+        # 但换算回人尺度后两段应当接近（同一套 delay_mu）
+        assert abs(m0 * 300.0 - m1 * 8.0) < 0.4 * (m0 * 300.0), \
+            "乘回各自 speed 后两段应落在同一量级"
+
+        # --list / --run 不应抛异常
+        from . import report as _rep
+        assert _rep.main([path, "--list"]) == 0
+        assert _rep.main([path, "--run", "2"]) == 0
+        assert _rep.main([path, "--run", "9"]) == 1     # 不存在的段号
+        # RUN 标记行不应混进事件统计
+        assert not any(r["state"] == "RUN" for run in runs for r in run["rows"])
+        assert sa["final_matches_source"] and sb["final_matches_source"]
+        del _csv, _json
+
+
+def test_log_fresh_truncates():
+    """--fresh 必须清空旧日志；默认（不加）则保留历史。"""
+    import tempfile
+
+    from .executor import Logger
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "fresh.csv")
+        lg = Logger(Config(log_file=path))
+        lg.log("KEY", "char", "'a'", 1.0)
+        lg.close()
+        first = open(path, encoding="utf-8").read()
+
+        lg = Logger(Config(log_file=path))          # 追加
+        lg.log("KEY", "char", "'b'", 1.0)
+        lg.close()
+        appended = open(path, encoding="utf-8").read()
+        assert appended.startswith(first), "默认应追加，不能吞掉旧内容"
+        assert "'b'" in appended and "'a'" in appended
+
+        lg = Logger(Config(log_file=path, fresh_log=True))   # 覆盖
+        lg.log("KEY", "char", "'c'", 1.0)
+        lg.close()
+        fresh = open(path, encoding="utf-8").read()
+        assert "'a'" not in fresh and "'b'" not in fresh, "--fresh 应清空历史"
+        assert "'c'" in fresh
+        assert fresh.count("run_id") == 1, "--fresh 后只应有一个表头"
+
+
+def test_log_legacy_compat():
+    """1.0 之前的老日志（无 run_id 列、无 RUN 行）仍要能被 report 读取。"""
+    import tempfile
+
+    from .report import load, split_runs
+
+    legacy = (
+        "ts,state,event,detail,delay_ms\n"
+        "22:38:50,KEY,char,'P',123.5\n"
+        "22:38:50,KEY,char,'S',189.6\n"
+        "22:38:51,KEY,char,'a',100.0\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "old.csv")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(legacy)
+        runs = split_runs(load(path))
+        assert len(runs) == 1, "老日志应被当作单次运行"
+        run = runs[0]
+        assert run["run_id"] == "(unsegmented)"
+        assert run["cfg"] is None, "老日志没有 config 快照，必须是 None"
+        assert not run["closed"], "老日志没有 RUN,end"
+        assert len(run["rows"]) == 3
+
+
+def test_log_empty_file_gets_header():
+    """回归：已存在但 0 字节的日志文件必须补写表头。
+
+    原来用 os.path.exists() 判断「是否新建」，而空文件的 exists 也是 True，
+    于是表头被跳过；report 的 DictReader 把第一行数据当表头，直接
+    KeyError: 'state' 崩掉。改成按文件大小判断。
+    """
+    import tempfile
+
+    from .executor import Logger
+    from .report import load, split_runs
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "empty.csv")
+        open(path, "w").close()                 # 0 字节，但「存在」
+        lg = Logger(Config(log_file=path))
+        lg.log("KEY", "char", "'a'", 100.0)
+        lg.close()
+        with open(path, encoding="utf-8") as f:
+            assert f.readline().startswith("ts,"), "空文件也必须写表头"
+        runs = split_runs(load(path))           # 以前这里 KeyError
+        assert len(runs) == 1 and len(runs[0]["rows"]) == 1
+
+
+def test_log_appends_to_legacy_file():
+    """回归：新版本运行追加到 1.0 的 5 列日志时，不能写错列。
+
+    原来无条件写 6 列，于是 DictReader 按 5 个字段名解析，新行的 run_id 落到
+    event 列、state 落到 detail 列……整段静默错位（实测写 2 个字符只统计出
+    1 个）。现在跟随既有表头写 5 列，并提示用户。
+    """
+    import tempfile
+
+    from .executor import Logger
+    from .report import load, split_runs
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "legacy.csv")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("ts,state,event,detail,delay_ms\n")
+            f.write("10:00:00,KEY,char,'a',120.0\n")
+        lg = Logger(Config(log_file=path))
+        lg.log("KEY", "char", "'b'", 130.0)
+        lg.close()
+
+        with open(path, encoding="utf-8") as f:
+            assert f.readline().strip() == "ts,state,event,detail,delay_ms"
+        rows = load(path)
+        # 关键：数据行的列不能错位（RUN 标记行也在其中，属正常）
+        data = [r for r in rows if r["state"] != "RUN"]
+        assert [r["state"] for r in data] == ["KEY", "KEY"], \
+            f"列错位了：{[r['state'] for r in rows]}"
+        assert [r["event"] for r in data] == ["char", "char"]
+        assert [r["detail"] for r in data] == ["'a'", "'b'"]
+        # 两次运行仍应被 RUN 标记切成两段
+        runs = split_runs(rows)
+        assert len(runs) == 2, f"应切成 2 段，实际 {len(runs)}"
+        assert sum(1 for run in runs for r in run["rows"]
+                   if r["event"] == "char") == 2, \
+            "两个字符都必须被统计到（错位时这里会少一个）"
+
+
+def test_report_survives_malformed_rows():
+    """坏日志不能让 report 崩掉——它的职责正是诊断坏日志。"""
+    import tempfile
+
+    from . import report as rep
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "bad.csv")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("ts,run_id,state,event,detail,delay_ms\n")
+            f.write("10:00:00,r1,KEY,char,'a',100.0\n")
+            f.write("10:00:01,r1,KEY,char\n")              # 列数不足
+            f.write("10:00:02,r1,KEY,char,'b',5,E,X\n")    # 列数过多
+            f.write("10:00:03,r1,KEY,char,'c',notanum\n")  # delay 非数字
+            f.write('10:00:04,r1,RUN,start,"{bad json",0.0\n')  # 快照损坏
+            f.write("10:00:05,r1,KEY,char,'d',110.0\n")
+        runs = rep.split_runs(rep.load(path))
+        assert len(runs) == 2
+        assert runs[0]["cfg"] is None, "损坏的快照应退回 None"
+        assert rep.main([path]) == 0
+        assert rep.main([path, "--list"]) == 0
+        # 非数字 delay 必须被跳过而不是抛 ValueError
+        assert rep.main([path, "--run", "2"]) == 0
+
+
+def test_report_exit_code_propagates():
+    """`python -m ...report` 必须把 main() 的返回值作为进程退出码。"""
+    import subprocess
+    import sys
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "x.csv")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("ts,run_id,state,event,detail,delay_ms\n")
+            f.write("10:00:00,r1,KEY,char,'a',100.0\n")
+        r = subprocess.run(
+            [sys.executable, "-m", "humanized_autotyper.report", path,
+             "--run", "9"], capture_output=True, text=True)
+        assert r.returncode == 1, \
+            f"找不到 run 时应返回 1，实际 {r.returncode}"
+        r = subprocess.run(
+            [sys.executable, "-m", "humanized_autotyper.report", path,
+             "--list"], capture_output=True, text=True)
+        assert r.returncode == 0, f"正常审计应返回 0，实际 {r.returncode}"
+
+
+def main():
+    test_buffer()
+    test_delays()
+    test_typos()
+    test_dyad_rhythm()
+    test_typo_speed_coupling()
+    test_full_dry_run()
+    test_edit_previous_unit()
+    test_rewrite_chunk_unit()
+    test_burst_unit()
+    test_pause_long_unit()
+    test_pause_long_ritual_clamped()
+    test_burst_no_fake_count()
+    test_transposition_payload()
+    test_kill_mid_edit_keeps_text()
+    test_kill_mid_burst_keeps_text()
+    test_source_guard()
+    test_review_keeps_text()
+    test_review_mid_correction_is_safe()
+    test_review_disabled_is_inert()
+    test_check_window_pauses_not_kills()
+    test_send_guard_blocks_keystroke_while_paused()
+    test_pause_blocks_typing_and_resumes()
+    test_pause_during_long_pause_resumes()
+    test_mixed_text_dry_run()
+    test_log_run_segmentation()
+    test_log_fresh_truncates()
+    test_log_legacy_compat()
+    test_log_empty_file_gets_header()
+    test_log_appends_to_legacy_file()
+    test_report_survives_malformed_rows()
+    test_report_exit_code_propagates()
+    print("ALL SANITY CHECKS PASSED")
+
+
+if __name__ == "__main__":
+    main()

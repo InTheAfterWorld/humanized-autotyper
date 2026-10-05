@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "humanized-autotyper"
+dynamic = ["version"]
+description = "模拟真人打字节奏的自动输入器：对数正态延迟、突发快打、错字回删、长暂停与恢复仪式"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    # 只有真实输入（--live / GUI 实机）才会 import pynput；
+    # dry-run、自检、审计日志都不需要它。
+    "pynput>=1.7",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+autotyper = "humanized_autotyper.main:main"
+autotyper-gui = "humanized_autotyper.gui:main"
+autotyper-report = "humanized_autotyper.report:main"
+
+[tool.setuptools]
+packages = ["humanized_autotyper"]
+
+[tool.setuptools.dynamic]
+version = {attr = "humanized_autotyper.__version__"}
