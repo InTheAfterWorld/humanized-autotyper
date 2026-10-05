@@ -13,6 +13,10 @@ public class Loan{
         return item;
     }
 
+    public User getUser() {
+        return user;
+    }
+
     public String toString(){
         return item + " is borrowed by " + user;
     }

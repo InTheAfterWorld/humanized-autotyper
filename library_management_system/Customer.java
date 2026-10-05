@@ -1,14 +1,14 @@
 public class Customer extends User{
 
-    public Customer() {
-        super();
+    public Customer(int id, String name) {
+        super(id, name);
     }
 
-    public borrowItem(){
-        
+    public boolean borrowItem(){
+        return false;
     }
 
-    public returnItem(){
-        
+    public boolean returnItem(){
+        return false;
     }
 }

@@ -55,7 +55,7 @@ public class Main {
             } else if (choice == 8) {
                 returnEmployeeItem();
             } else if (choice == 9) {
-                disposeItem();
+                disposeItem(master);
             } else if (choice == 10) {
                 library.showInventory();
             } else if (choice == 11) {
@@ -85,14 +85,31 @@ public class Main {
         System.out.print("User ID: ");
         int userId = input.nextInt();
 
-        library.borrow(itemId, userId);
+        User user = library.findUser(userId);
+
+        if (user == null) {
+            System.out.println("User not found.");
+            return;
+        }
+
+        user.borrow(library.findItem(itemId));
     }
 
     public static void returnItem() {
         System.out.print("Item ID: ");
         int itemId = input.nextInt();
 
-        library.returnItem(itemId);
+        System.out.print("User ID: ");
+        int userId = input.nextInt();
+
+        User user = library.findUser(userId);
+
+        if (user == null) {
+            System.out.println("User not found.");
+            return;
+        }
+
+        user.returnItem(library.findItem(itemId));
     }
 
     public static void reserve() {
@@ -102,7 +119,14 @@ public class Main {
         System.out.print("User ID: ");
         int userId = input.nextInt();
 
-        library.reserve(itemId, userId);
+        User user = library.findUser(userId);
+
+        if (user == null) {
+            System.out.println("User not found.");
+            return;
+        }
+
+        user.reserve(library.findItem(itemId));
     }
 
     public static void employeeRequest() {
@@ -116,7 +140,16 @@ public class Main {
         System.out.print("Request type: ");
         String type = input.nextLine();
 
-        library.createRequest(employeeId, itemId, type);
+        User user = library.findUser(employeeId);
+
+        if (!(user instanceof Employee)) {
+            System.out.println("Invalid employee.");
+            return;
+        }
+
+        Employee employee = (Employee) user;
+
+        employee.createRequest(library.findItem(itemId), type);
     }
 
     public static void approveRequest(MasterLibrarian master) {
@@ -125,7 +158,7 @@ public class Main {
         System.out.print("Request number: ");
         int index = input.nextInt();
 
-        library.approveRequest(index, master);
+        master.approveRequest(library.getRequest(index));
     }
 
     public static void addItem(MasterLibrarian master) {
@@ -167,20 +200,32 @@ public class Main {
             item = new AudioBook(id, title, author, genre, rating, extra);
         }
 
-        library.addNewItem(item, master);
+        master.addItem(item);
     }
 
     public static void returnEmployeeItem() {
         System.out.print("Item ID: ");
         int itemId = input.nextInt();
 
-        library.returnEmployeeItem(itemId);
+        System.out.print("Employee ID: ");
+        int employeeId = input.nextInt();
+
+        User user = library.findUser(employeeId);
+
+        if (!(user instanceof Employee)) {
+            System.out.println("Invalid employee.");
+            return;
+        }
+
+        Employee employee = (Employee) user;
+
+        employee.returnEmployeeItem(library.findItem(itemId));
     }
 
-    public static void disposeItem() {
+    public static void disposeItem(MasterLibrarian master) {
         System.out.print("Item ID: ");
         int itemId = input.nextInt();
 
-        library.disposeItem(itemId);
+        master.disposeItem(library.findItem(itemId));
     }
 }

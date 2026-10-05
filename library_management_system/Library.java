@@ -1,19 +1,21 @@
-import java.util.*;
-import java.io.*;
+import java.util.ArrayList;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.util.Scanner;
 
 public class Library {
     private ArrayList<Item> items;
     private ArrayList<User> users;
     private ArrayList<Loan> loans;
     private ArrayList<Reservation> reservations;
-    private ArrayList<EmployeeRequest> employeeRequests;
+    private ArrayList<EmployeeRequest> requests;
 
     public Library(){
         items = new ArrayList<>();
         users = new ArrayList<>();
         loans = new ArrayList<>();
         reservations = new ArrayList<>();
-        employeeRequests = new ArrayList<>();
+        requests = new ArrayList<>();
     }
 
     public void loadInventory(String fileName) {
@@ -49,8 +51,30 @@ public class Library {
         }
     }
 
+    public void search(String text) {
+        String query = text.toLowerCase();
+
+        boolean found = false;
+
+        for (Item item : items) {
+            if (item.getTitle().toLowerCase().contains(query)
+                    || item.getAuthor().toLowerCase().contains(query)
+                    || item.getGenre().toLowerCase().contains(query)
+                    || item.getType().toLowerCase().contains(query)
+                    || String.valueOf(item.getRating()).contains(query)) {
+                System.out.println(item);
+                found = true;
+            }
+        }
+
+        if (!found) {
+            System.out.println("No items matched \"" + text + "\".");
+        }
+    }
+
     public void addUser(User user){
         users.add(user);
+        user.setLibrary(this);
     }
 
     public Item findItem(int id){
@@ -73,182 +97,65 @@ public class Library {
         return null;
     }
 
-    public void borrow(int itemId, int userId) {
-        Item item = findItem(itemId);
-        User user = findUser(userId);
-
-        if (item == null || user == null) {
-            System.out.println("Item or user not found.");
-            return;
-        }
-
-        if (!item.isAvailable()) {
-            System.out.println("Item is unavailable.");
-            return;
-        }
-
-        item.setAvailable(false);
-        loans.add(new Loan(item, user));
-
-        System.out.println("Item borrowed.");
+    public void addLoan(Loan loan) {
+        loans.add(loan);
     }
 
-        public void returnItem(int itemId) {
-        Item item = findItem(itemId);
+    public void addReservation(Reservation reservation) {
+        reservations.add(reservation);
+    }
 
-        if (item == null) {
-            System.out.println("Item not found.");
-            return;
-        }
+    public void addRequest(EmployeeRequest request) {
+        requests.add(request);
+    }
 
+    void removeLoan(Item item) {
         for (int i = 0; i < loans.size(); i++) {
-            if (loans.get(i).getItem().getId() == itemId) {
+            if (loans.get(i).getItem().getId() == item.getId()) {
                 loans.remove(i);
                 break;
             }
         }
-
-        item.setAvailable(true);
-
-        System.out.println("Item returned.");
-
-        if (hasReservation(item)) {
-            System.out.println("This item is reserved for a user.");
-        }
     }
 
-    public void addItem(Item item, MasterLibrarian ml){
-        items.add(item);
-    }
-
-    public void returnItem(int itemId) {
-        Item item = findItem(itemId);
-
-        if (item == null) {
-            System.out.println("Item not found.");
-            return;
-        }
-
-        for (int i = 0; i < loans.size(); i++) {
-            if (loans.get(i).getItem().getId() == itemId) {
-                loans.remove(i);
-                break;
-            }
-        }
-
-        item.setAvailable(true);
-
-        System.out.println("Item returned.");
-
-        if (hasReservation(item)) {
-            System.out.println("This item is reserved.");
-        }
-    }
-
-    public void reserve(int itemId, int userId) {
-        Item item = findItem(itemId);
-        User user = findUser(userId);
-
-        if (item == null || user == null) {
-            System.out.println("Item or user not found.");
-            return;
-        }
-
-        if (item.isAvailable()) {
-            System.out.println("Item is available to borrow");
-            return;
-        }
-
-        reservations.add(new Reservation(item, user));
-
-        System.out.println("Item reserved.");
-    }
-
-
-    private boolean hasReservation(Item item) {
+    Reservation findReservation(Item item) {
         for (Reservation reservation : reservations) {
             if (reservation.getItem().getId() == item.getId()) {
-                return true;
+                return reservation;
             }
         }
 
-        return false;
+        return null;
     }
 
-    public void createRequest(int employeeId, int itemId, String type) {
-        User user = findUser(employeeId);
-        Item item = findItem(itemId);
-
-        if (!(user instanceof Employee) || item == null) {
-            System.out.println("Invalid employee or item.");
-            return;
-        }
-
-        Employee employee = (Employee) user;
-
-        requests.add(new EmployeeRequest(employee, item, type));
-
-        System.out.println("Request created.");
-    }
-
-    public void approveRequest(int index, MasterLibrarian librarian) {
+    EmployeeRequest getRequest(int index) {
         if (index < 0 || index >= requests.size()) {
-            System.out.println("Invalid request.");
-            return;
+            return null;
         }
 
-        EmployeeRequest request = requests.get(index);
-
-        if (request.isApproved()) {
-            System.out.println("Request already approved.");
-            return;
-        }
-
-        if (!request.getItem().isAvailable()) {
-            System.out.println("Item is unavailable.");
-            return;
-        }
-
-        request.approve();
-        request.getItem().setAvailable(false);
-
-        System.out.println("Request approved.");
+        return requests.get(index);
     }
 
-    public void addNewItem(Item item, MasterLibrarian librarian) {
-        if (findItem(item.getId()) != null) {
-            System.out.println("That ID already exists.");
-            return;
-        }
-
+    void addNewItem(Item item) {
         items.add(item);
-
-        System.out.println("Item added.");
     }
 
-    public void returnEmployeeItem(int itemId) {
-        Item item = findItem(itemId);
-
-        if (item == null) {
-            System.out.println("Item not found.");
-            return;
-        }
-
-        item.setAvailable(true);
-        System.out.println("Employee item returned.");
-    }
-
-    public void disposeItem(int itemId) {
-        Item item = findItem(itemId);
-
-        if (item == null) {
-            System.out.println("Item not found.");
-            return;
-        }
-
+    void removeItem(Item item) {
         items.remove(item);
 
-        System.out.println("Item disposed.");
+        for (int i = 0; i < reservations.size(); i++) {
+            if (reservations.get(i).getItem().getId() == item.getId()) {
+                reservations.remove(i);
+                break;
+            }
+        }
+
+        for (int i = 0; i < loans.size(); i++) {
+            if (loans.get(i).getItem().getId() == item.getId()) {
+                loans.remove(i);
+                break;
+            }
+        }
     }
 
     public void showInventory() {

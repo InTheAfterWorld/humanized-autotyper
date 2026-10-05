@@ -9,6 +9,14 @@ public class Reservation{
         user = _user_;
     }
 
+    public Item getItem() {
+        return item;
+    }
+
+    public User getUser() {
+        return user;
+    }
+
     public String toString(){
         return item + " is reserved by " + user;
     }

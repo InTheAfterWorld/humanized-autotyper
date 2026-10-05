@@ -1,25 +1,22 @@
 public abstract class Item {
 
+    private int id;
     private String title;
     private String author;
     private String genre;
     private double rating;
-    private int id;
-    private boolean availability;
-    private String types;
-    private boolean reserved;
+    private boolean available;
 
-    public Item (String _title_, String a, String g, double r, int _id_, boolean _availability_, String _types_){
-        title = _title_;
-        author = a;
-        genre = g;
-        rating = r;
-        id = _id_;
-        availability = _availability_;
-        types = _types_;
+    public Item(int id, String title, String author, String genre, double rating) {
+        this.id = id;
+        this.title = title;
+        this.author = author;
+        this.genre = genre;
+        this.rating = rating;
+        this.available = true;
     }
 
-    public int getId(){
+    public int getId() {
         return id;
     }
 
@@ -35,21 +32,23 @@ public abstract class Item {
         return genre;
     }
 
+    public double getRating() {
+        return rating;
+    }
+
     public boolean isAvailable() {
-        return availability;
+        return available;
     }
 
-    public String getType() {
-        return types;
+    public void setAvailable(boolean available) {
+        this.available = available;
     }
 
-    public void setAvailable(boolean ava) {
-        availability = ava;
-    }
+    public abstract String getType();
 
     public String toString() {
         return id + " | " + getType() + " | " + title + " | "
                 + author + " | " + genre + " | " + rating + " | "
-                + (availability ? "Available" : "Unavailable");
+                + (available ? "Available" : "Unavailable");
     }
 }
