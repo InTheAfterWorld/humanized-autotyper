@@ -53,13 +53,18 @@ class AutoTyper:
 
     # rng 默认必须是 random.Random 实例（与 delays.py / typos.py 同理）：写
     # `rng=random` 会被推成 ModuleType，与全部 `rng=random.Random(n)` 调用冲突。
+    #
+    # mode/targets 是多模式扩展点（见 modes.py）。默认 None 时退化成 1.x 行为：
+    # 单个 source 字符串 + 缓冲区自校验，`run()` 逻辑与重构前逐字相同。
     def __init__(self, cfg: Config, source: str, rng: random.Random = random.Random(),
                  buffer=None, executor=None, logger=None, killer=None,
-                 delays=None, scheduler=None):
+                 delays=None, scheduler=None, mode=None, targets=None):
         self.cfg = cfg
         self.rng = rng
         self.source = source
         self.pipeline = Pipeline(source)
+        self.mode = mode
+        self.targets = targets
         self.buffer = buffer if buffer is not None else Buffer("")
         self.kill = killer if killer is not None else Killer()
         self.logger = logger if logger is not None else Logger(cfg)
@@ -100,9 +105,14 @@ class AutoTyper:
         }
 
     def run(self):
-        self.executor.start()
-        self.executor.check_window()
-        self.started_at = time.time()
+        # 多目标模式（VSCode 等）走文件循环；单目标（默认）走原来的单文档路径，
+        # 两者共用下面这一个 _drive()，因此状态机行为完全一致。
+        if self.mode is not None and getattr(self.mode, "multi_target", False):
+            return self._run_multi()
+        return self._run_single()
+
+    def _drive(self):
+        """跑完当前 target 的打字状态机（单文档与多模式共用）。"""
         state = "TYPING"
         try:
             while not self.kill.killed() and not self.finished:
@@ -115,6 +125,15 @@ class AutoTyper:
             self.kill.set()
         finally:
             self._flush_correction()
+
+    def _run_single(self):
+        """1.x 原始路径：单文档 + 缓冲区自校验。逐字保持原行为。"""
+        self.executor.start()
+        self.executor.check_window()
+        self.started_at = time.time()
+        try:
+            self._drive()
+        finally:
             self.executor.stop()
         elapsed = time.time() - self.started_at
         summary = dict(self.stats)
@@ -129,6 +148,93 @@ class AutoTyper:
         except Exception:
             pass
         return summary
+
+    def _run_multi(self):
+        """多目标模式：对每个 Target 重置 buffer/pipeline 后各跑一遍状态机。
+
+        与单文档路径的关键差异：
+        - 每个文件开始前重置 buffer / pipeline / finished / 长暂停调度器，
+          否则第二个文件会带着第一个文件的疲劳与光标位置跑，必然出错；
+        - 逐文件调用 mode.before_type() / mode.after_type()，由模式负责定位
+          编辑器与校验；
+        - summary 里的 final_matches_source 只有在 mode.verify_trustworthy()
+          为真时才可信，否则置 None 并在 per_file 里给出逐文件结论。
+        """
+        targets = self.targets or []
+        self.executor.start()
+        self.executor.check_window()
+        self.started_at = time.time()
+        per_file = []
+        total_chars = 0
+        try:
+            for idx, target in enumerate(targets, 1):
+                if self.kill.killed():
+                    break
+                self._reset_for_target()
+                self.source = target.content
+                self.pipeline = Pipeline(target.content)
+                self.logger.log("FILE", "start",
+                                 f"{idx}/{len(targets)} {target.path}", 0)
+                if self.cfg.progress_hook:
+                    try:
+                        self.cfg.progress_hook(idx - 1, len(targets), target)
+                    except Exception:
+                        pass
+                try:
+                    self.mode.before_type(target, self)
+                except Exception as exc:
+                    self.logger.log("FILE", "acquire_failed",
+                                     f"{target.path}: {exc!r}", 0)
+                    per_file.append({"path": target.path, "ok": False,
+                                     "error": f"定位失败: {exc}"})
+                    continue
+                self._drive()
+                result = {}
+                try:
+                    result = self.mode.after_type(target, self) or {}
+                except Exception as exc:
+                    result = {"ok": False, "error": f"校验失败: {exc}"}
+                total_chars += self.stats["chars"]
+                per_file.append({"path": target.path,
+                                 "ok": bool(result.get("ok")),
+                                 "detail": result.get("detail", ""),
+                                 "chars": self.stats["chars"]})
+        finally:
+            self.executor.stop()
+        elapsed = time.time() - self.started_at
+        summary = dict(self.stats)
+        summary["chars"] = total_chars
+        summary["files"] = len(targets)
+        summary["files_ok"] = sum(1 for f in per_file if f["ok"])
+        summary["per_file"] = per_file
+        summary["elapsed_s"] = round(elapsed, 1)
+        summary["killed"] = self.kill.killed()
+        # 内存缓冲区在多目标模式下不能代表真实文档（编辑器会改写、且每个文件
+        # 都会重置），所以不能报 final_matches_source——由 per_file 给出结论。
+        summary["final_matches_source"] = (
+            None if not self.mode.verify_trustworthy()
+            else self.buffer.text == self.source)
+        summary["verify_trustworthy"] = self.mode.verify_trustworthy()
+        try:
+            self.logger.mark_end(summary)
+        except Exception:
+            pass
+        return summary
+
+    def _reset_for_target(self):
+        """切换到下一个文件前清干净跨文件状态。"""
+        self.buffer = Buffer("")
+        self.finished = False
+        self.last_sent = ""
+        self.err_typed = ""
+        self.err_intended = ""
+        self.err_detect_in = -1
+        self.pause_long_left = 0.0
+        # 疲劳/预热是"一个人连续打字"的属性；换文件等于换了一次会话，
+        # 但同一轮任务里的累积节奏保留——所以只重置长暂停调度器。
+        self.sched.reset()
+        for k in self.stats:
+            self.stats[k] = 0
 
     def _progress(self):
         pct = 100.0 * self.pipeline.i / max(1, len(self.source))

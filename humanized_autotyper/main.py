@@ -7,6 +7,7 @@ import time
 from .config import Config
 from .keymap import unsupported_chars
 from .machine import AutoTyper
+from .modes import SingleFileMode, get_mode, mode_names
 from .presets import PRESETS, apply_preset, describe, preset_names
 
 DEMO_SOURCE = '''def compute_stats(numbers):
@@ -87,11 +88,25 @@ def parse_args(argv):
                         "(the log accumulates runs otherwise; report can split "
                         "them, but --fresh keeps the file single-run)")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--mode", default="notepad", metavar="NAME",
+                   help=f"typing mode, one of: {', '.join(mode_names())} "
+                        "(default: notepad; --mode list for details)")
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.mode in ("list", "?"):
+        print("available modes:")
+        for name in mode_names():
+            cls = get_mode(name)
+            print(f"  {name:10s} {getattr(cls, 'label', '')}")
+        return 0
+    if args.mode not in mode_names():
+        print(f"ERROR: unknown mode '{args.mode}'. "
+              f"Available: {', '.join(mode_names())} "
+              f"(or --mode list for details)")
+        return 1
     if args.preset in ("list", "?"):
         print("available presets:")
         for name in preset_names():
@@ -134,10 +149,14 @@ def main(argv=None):
         return 1
 
     rng = random.Random(args.seed)
-    typer = AutoTyper(cfg, source, rng=rng)
+    # 模式：目前只有 notepad（单文件），它就是 1.x 的原行为。多目标模式
+# （VSCode 等）由 mode.iter_targets() 提供 targets 并置 multi_target。
+    typer_mode = SingleFileMode(source, source_desc)
+    typer = AutoTyper(cfg, source, rng=rng, mode=typer_mode)
 
-    mode = "LIVE" if not cfg.dry_run else "DRY-RUN"
-    print(f"mode={mode} chars={len(source)} speed={cfg.speed_multiplier}x "
+    run_mode = "LIVE" if not cfg.dry_run else "DRY-RUN"
+    print(f"mode={run_mode} type_mode={args.mode} chars={len(source)} "
+          f"speed={cfg.speed_multiplier}x "
           f"kill_hotkey={cfg.kill_hotkey.upper()}")
     print(f"source: {source_desc}")
     print(f"preset: {args.preset} ({describe(args.preset)}, "

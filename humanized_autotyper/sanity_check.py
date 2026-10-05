@@ -848,6 +848,113 @@ def test_report_exit_code_propagates():
         assert r.returncode == 0, f"正常审计应返回 0，实际 {r.returncode}"
 
 
+def test_modes_single_file_is_1x_equivalent():
+    """SingleFileMode 必须与 1.x 行为等价：单个 target、缓冲区自校验可信。"""
+    from .modes import SingleFileMode, Mode, collect_targets
+
+    m = SingleFileMode(DEMO_SOURCE, "demo.py")
+    assert m.multi_target is False, "单文件模式不该走多目标循环"
+    assert m.verify_trustworthy() is True, "单文件模式缓冲区即真相，可信"
+
+    targets = collect_targets(m, DEMO_SOURCE)
+    assert len(targets) == 1 and targets[0].content == DEMO_SOURCE
+    assert m.preflight(targets) == []
+
+    # 默认注册表里必须有 notepad，且 AutoTyper 不传 mode 时行为不变
+    from .modes import mode_names, get_mode
+    assert "notepad" in mode_names()
+    # get_mode 返回的是「类」：各模式构造参数不同，由调用方实例化
+    assert get_mode("notepad") is SingleFileMode
+    assert issubclass(SingleFileMode, Mode)
+    print("PASS modes_single_file_is_1x_equivalent")
+
+
+def test_modes_multi_target_resets_between_files():
+    """多目标模式：每个文件前必须重置 buffer/pipeline/stats，否则第二个文件
+    会带着第一个文件的文本与光标跑，结果必然错。"""
+    from .modes import Mode, Target
+
+    class FakeMulti(Mode):
+        name = "fake"
+        multi_target = True
+
+        def __init__(self):
+            self.seen = []
+            self.done = []
+
+        def iter_targets(self, source=None, **kw):
+            return [Target(path=f"f{i}.py", content=f"file {i}\n")
+                    for i in range(3)]
+
+        def before_type(self, target, typer):
+            self.seen.append((target.path, typer.buffer.text,
+                              typer.buffer.cursor))
+
+        def after_type(self, target, typer):
+            # 断言"打完的缓冲区 == 该文件的内容"（不是上一个文件的）
+            self.done.append((target.path, typer.buffer.text))
+            return {"ok": typer.buffer.text == target.content,
+                    "detail": "" if typer.buffer.text == target.content
+                    else "mismatch"}
+
+        def verify_trustworthy(self):
+            return False
+
+    cfg = fast_cfg()
+    m = FakeMulti()
+    t = AutoTyper(cfg, "", rng=random.Random(3), mode=m, targets=m.iter_targets())
+    t.sched.threshold = 1e18
+    s = t.run()
+
+    # before_type 时 buffer 必须是空的、cursor 为 0
+    assert [s0 for s0, _, _ in m.seen] == ["f0.py", "f1.py", "f2.py"]
+    for _, text, cur in m.seen:
+        assert text == "" and cur == 0, "跨文件时缓冲区没重置"
+
+    assert s["files"] == 3
+    assert s["files_ok"] == 3, f"逐文件校验应全过: {s['per_file']}"
+    # 缓冲区不可信时不得谎报 final_matches_source
+    assert s["verify_trustworthy"] is False
+    assert s["final_matches_source"] is None, \
+        "verify_trustworthy=False 时不能报 final_matches_source"
+    # 每个文件打完的缓冲区必须等于自己那份内容（注意内容带尾随 \n）
+    expected = {f"f{i}.py": f"file {i}\n" for i in range(3)}
+    for path, text in m.done:
+        assert text == expected[path], f"{path} 内容串了: {text!r}"
+    print("PASS modes_multi_target_resets_between_files "
+          f"files={s['files']} ok={s['files_ok']}")
+
+
+def test_modes_kill_stops_remaining_files():
+    """F10 后必须立刻停止，不再处理后续文件。"""
+    from .modes import Mode, Target
+
+    class KillMode(Mode):
+        name = "killmode"
+        multi_target = True
+
+        def iter_targets(self, source=None, **kw):
+            return [Target(path=f"f{i}.py", content="x\n") for i in range(10)]
+
+        def before_type(self, target, typer):
+            if target.path == "f1.py":
+                typer.kill.set()      # 第二个文件刚开始就请求停止
+
+        def verify_trustworthy(self):
+            return False
+
+    cfg = fast_cfg()
+    m = KillMode()
+    t = AutoTyper(cfg, "", rng=random.Random(4), mode=m, targets=m.iter_targets())
+    t.sched.threshold = 1e18
+    s = t.run()
+    assert s["killed"] is True
+    assert s["files"] == 10
+    assert len(s["per_file"]) <= 2, \
+        f"停止后不该继续处理文件，实际处理了 {len(s['per_file'])}"
+    print(f"PASS modes_kill_stops_remaining_files handled={len(s['per_file'])}/10")
+
+
 def main():
     test_buffer()
     test_delays()
@@ -880,6 +987,9 @@ def main():
     test_log_appends_to_legacy_file()
     test_report_survives_malformed_rows()
     test_report_exit_code_propagates()
+    test_modes_single_file_is_1x_equivalent()
+    test_modes_multi_target_resets_between_files()
+    test_modes_kill_stops_remaining_files()
     print("ALL SANITY CHECKS PASSED")
 
 

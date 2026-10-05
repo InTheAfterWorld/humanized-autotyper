@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from typing import Any
 
 
 def _ln(x):
@@ -17,6 +18,10 @@ class Config:
     # 启动时清空日志（--fresh）。默认 False = 追加，历史运行会留在同一个文件里，
     # 但每次运行都会写 RUN 标记行，report 能据此切分（见 report.py::split_runs）。
     fresh_log: bool = False
+    # 多文件模式的进度回调 (done, total, target) -> None；GUI 用它更新进度条。
+    # 故意不做成 Callable 注解——dataclass 字段类型会被类型检查器严格校验，
+    # 而这里只需要"有或没有"。None = 单文档模式，不触发。
+    progress_hook: Any = None
     verbose: bool = False
 
     p_typo: float = 0.012

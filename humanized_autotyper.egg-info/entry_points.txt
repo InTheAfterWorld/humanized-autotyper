@@ -1,4 +1,0 @@
-[console_scripts]
-autotyper = humanized_autotyper.main:main
-autotyper-gui = humanized_autotyper.gui:main
-autotyper-report = humanized_autotyper.report:main
