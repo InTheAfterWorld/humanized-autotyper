@@ -32,7 +32,7 @@ public class User{
             return;
         }
 
-        item.setAvailable(false);
+        item.borrow();
 
         if (library != null) {
             library.addLoan(new Loan(item, this));
@@ -49,9 +49,9 @@ public class User{
 
         if (library != null) {
             library.removeLoan(item);
+        } else {
+            item.returnItem();
         }
-
-        item.setAvailable(true);
 
         System.out.println(name + " returned " + item.getTitle() + ".");
 
@@ -76,6 +76,11 @@ public class User{
         }
 
         if (library != null) {
+            if (library.findReservationByUser(item, this) != null) {
+                System.out.println("You have already reserved this item.");
+                return;
+            }
+
             if (library.findReservation(item) != null) {
                 System.out.println("Item is already reserved.");
                 return;

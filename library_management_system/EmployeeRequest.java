@@ -3,6 +3,7 @@ public class EmployeeRequest {
     private Item item;
     private String type;
     private boolean approved;
+    private boolean rejected;
 
     public EmployeeRequest(Employee employee, Item item, String type) {
         this.employee = employee;
@@ -27,14 +28,32 @@ public class EmployeeRequest {
         return approved;
     }
 
+    public boolean isPending() {
+        return !approved && !rejected;
+    }
+
     public void approve() {
         approved = true;
     }
 
+    public void reject() {
+        rejected = true;
+    }
+
     public String toString() {
+        String status;
+
+        if (approved) {
+            status = "Approved";
+        } else if (rejected) {
+            status = "Rejected";
+        } else {
+            status = "Pending";
+        }
+
         return employee.getName() + " | "
                 + item.getTitle() + " | "
                 + type + " | "
-                + (approved ? "Approved" : "Pending");
+                + status;
     }
 }

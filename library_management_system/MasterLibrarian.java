@@ -10,8 +10,8 @@ public class MasterLibrarian extends Employee {
             return;
         }
 
-        if (request.isApproved()) {
-            System.out.println("Request already approved.");
+        if (!request.isPending()) {
+            System.out.println("Request is not pending.");
             return;
         }
 
@@ -21,9 +21,25 @@ public class MasterLibrarian extends Employee {
         }
 
         request.approve();
-        request.getItem().setAvailable(false);
+        request.getItem().borrow();
 
         System.out.println(getName() + " approved the request for " + request.getItem().getTitle() + ".");
+    }
+
+    public void rejectRequest(EmployeeRequest request) {
+        if (request == null) {
+            System.out.println("Request not found.");
+            return;
+        }
+
+        if (!request.isPending()) {
+            System.out.println("Request is not pending.");
+            return;
+        }
+
+        request.reject();
+
+        System.out.println(getName() + " rejected the request for " + request.getItem().getTitle() + ".");
     }
 
     public void addItem(Item item) {

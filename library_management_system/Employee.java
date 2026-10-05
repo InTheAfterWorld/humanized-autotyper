@@ -23,7 +23,7 @@ public class Employee extends User{
             return;
         }
 
-        item.setAvailable(true);
+        item.returnItem();
 
         System.out.println(getName() + " returned " + item.getTitle() + ".");
     }

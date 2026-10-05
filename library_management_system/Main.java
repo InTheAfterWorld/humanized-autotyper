@@ -25,13 +25,14 @@ public class Main {
             System.out.println("4. Reserve");
             System.out.println("5. Employee Request");
             System.out.println("6. Approve Request");
-            System.out.println("7. Add Item");
-            System.out.println("8. Return Employee Item");
-            System.out.println("9. Dispose Item");
-            System.out.println("10. Inventory");
-            System.out.println("11. Loans");
-            System.out.println("12. Reservations");
-            System.out.println("13. Employee Requests");
+            System.out.println("7. Reject Request");
+            System.out.println("8. Add Item");
+            System.out.println("9. Return Employee Item");
+            System.out.println("10. Dispose Item");
+            System.out.println("11. Inventory");
+            System.out.println("12. Loans");
+            System.out.println("13. Reservations");
+            System.out.println("14. Employee Requests");
             System.out.println("0. Exit");
             System.out.print("Choice: ");
 
@@ -51,18 +52,20 @@ public class Main {
             } else if (choice == 6) {
                 approveRequest(master);
             } else if (choice == 7) {
-                addItem(master);
+                rejectRequest(master);
             } else if (choice == 8) {
-                returnEmployeeItem();
+                addItem(master);
             } else if (choice == 9) {
-                disposeItem(master);
+                returnEmployeeItem();
             } else if (choice == 10) {
-                library.showInventory();
+                disposeItem(master);
             } else if (choice == 11) {
-                library.showLoans();
+                library.showInventory();
             } else if (choice == 12) {
-                library.showReservations();
+                library.showLoans();
             } else if (choice == 13) {
+                library.showReservations();
+            } else if (choice == 14) {
                 library.showRequests();
             }
 
@@ -159,6 +162,15 @@ public class Main {
         int index = input.nextInt();
 
         master.approveRequest(library.getRequest(index));
+    }
+
+    public static void rejectRequest(MasterLibrarian master) {
+        library.showRequests();
+
+        System.out.print("Request number: ");
+        int index = input.nextInt();
+
+        master.rejectRequest(library.getRequest(index));
     }
 
     public static void addItem(MasterLibrarian master) {

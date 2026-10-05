@@ -111,7 +111,8 @@ public class Library {
 
     void removeLoan(Item item) {
         for (int i = 0; i < loans.size(); i++) {
-            if (loans.get(i).getItem().getId() == item.getId()) {
+            if (loans.get(i).isFor(item)) {
+                loans.get(i).close();
                 loans.remove(i);
                 break;
             }
@@ -120,7 +121,17 @@ public class Library {
 
     Reservation findReservation(Item item) {
         for (Reservation reservation : reservations) {
-            if (reservation.getItem().getId() == item.getId()) {
+            if (reservation.isFor(item) && !reservation.isCancelled()) {
+                return reservation;
+            }
+        }
+
+        return null;
+    }
+
+    Reservation findReservationByUser(Item item, User user) {
+        for (Reservation reservation : reservations) {
+            if (reservation.isFor(item) && reservation.isMadeBy(user) && !reservation.isCancelled()) {
                 return reservation;
             }
         }
@@ -144,14 +155,16 @@ public class Library {
         items.remove(item);
 
         for (int i = 0; i < reservations.size(); i++) {
-            if (reservations.get(i).getItem().getId() == item.getId()) {
+            if (reservations.get(i).isFor(item)) {
+                reservations.get(i).cancel();
                 reservations.remove(i);
                 break;
             }
         }
 
         for (int i = 0; i < loans.size(); i++) {
-            if (loans.get(i).getItem().getId() == item.getId()) {
+            if (loans.get(i).isFor(item)) {
+                loans.get(i).close();
                 loans.remove(i);
                 break;
             }

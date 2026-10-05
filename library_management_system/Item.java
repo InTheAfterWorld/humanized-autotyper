@@ -40,6 +40,14 @@ public abstract class Item {
         return available;
     }
 
+    public void borrow() {
+        available = false;
+    }
+
+    public void returnItem() {
+        available = true;
+    }
+
     public void setAvailable(boolean available) {
         this.available = available;
     }
