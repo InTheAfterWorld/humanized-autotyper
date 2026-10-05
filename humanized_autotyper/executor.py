@@ -301,6 +301,48 @@ class Executor:
         self._sleep(hold if hold is not None else self.delays.nav_delay())
         self.controller.release(key)
 
+    def tap_combo(self, keys, label=None, hold=None):
+        """按组合键，如 [Key.ctrl, KeyCode.from_char('s')]。
+
+        顺序按下、逆序松开（与真实按键行为一致，pynput 不会自动处理）。
+        与其他发键方法一样在 dry-run 下只记日志不发键。
+        """
+        self.log.log("KEY", "combo", label or "+".join(str(k) for k in keys),
+                     0)
+        if self.controller is None or not keys:
+            return
+        for k in keys:
+            self.controller.press(k)
+        self._sleep(hold if hold is not None else self.delays.nav_delay())
+        for k in reversed(list(keys)):
+            self.controller.release(k)
+
+    def _ctrl_key(self, ch):
+        """Ctrl + 单个字母/符号。返回 None 表示当前环境发不出去。"""
+        if self.controller is None or self._Key is None or self._KeyCode is None:
+            return None
+        base = SHIFT_SYMBOLS.get(ch, ch)
+        kc = self._KeyCode.from_char(base) if base else None
+        if kc is None:
+            return None
+        return [self._Key.ctrl, kc]
+
+    def key_escape(self):
+        self.tap_combo([self._Key.escape] if self._Key else [],
+                       label="escape")
+
+    def key_save(self):
+        """Ctrl+S。"""
+        keys = self._ctrl_key("s")
+        if keys is not None:
+            self.tap_combo(keys, label="ctrl+s")
+
+    def key_quick_open(self):
+        """Ctrl+P（VSCode Quick Open）。"""
+        keys = self._ctrl_key("p")
+        if keys is not None:
+            self.tap_combo(keys, label="ctrl+p")
+
     def backspace(self):
         self._tap_special("backspace")
 

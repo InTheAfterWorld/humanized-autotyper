@@ -955,6 +955,52 @@ def test_modes_kill_stops_remaining_files():
     print(f"PASS modes_kill_stops_remaining_files handled={len(s['per_file'])}/10")
 
 
+def test_combo_keys_dry_run_and_ordering():
+    """组合键：dry-run 只记日志不发键；live 下按下顺序正序、松开顺序逆序。"""
+    import random as _r
+
+    from .executor import Executor, Killer, Logger
+
+    # --- dry-run：不能崩，且必须有日志 ---
+    cfg = fast_cfg()
+    ex = Executor(cfg, DelayModel(cfg, _r.Random(1)), Logger(cfg), Killer())
+    assert ex.controller is None
+    ex.tap_combo(["ctrl", "s"], label="ctrl+s")
+    ex.key_save()
+    ex.key_quick_open()
+    ex.key_escape()
+    assert ex.controller is None, "dry-run 下不应创建 controller"
+
+    # --- live：用桩 controller 记录顺序 ---
+    cfg2 = fast_cfg(dry_run=False)
+    ex2 = Executor(cfg2, DelayModel(cfg2, _r.Random(1)), Logger(cfg2), Killer())
+    assert ex2.controller is not None
+    events = []
+    ex2.controller.press = lambda k: events.append(("press", str(k)))
+    ex2.controller.release = lambda k: events.append(("release", str(k)))
+    ex2.listener = None                      # 别真的去监听键盘
+
+    ex2.tap_combo(["A", "B", "C"], label="triple")
+    assert events == [("press", "A"), ("press", "B"), ("press", "C"),
+                      ("release", "C"), ("release", "B"), ("release", "A")], \
+        f"组合键顺序错误: {events}"
+    # press 与 release 必须成对，否则修饰键会卡住
+    assert len([e for e in events if e[0] == "press"]) == \
+        len([e for e in events if e[0] == "release"])
+
+    # Ctrl 组合：ctrl 先按下最后松开
+    events.clear()
+    ex2.key_save()
+    assert events[0] == ("press", "Key.ctrl"), f"Ctrl 应先按下: {events}"
+    assert events[-1] == ("release", "Key.ctrl"), f"Ctrl 应最后松开: {events}"
+
+    # 空组合不应崩也不应发键
+    events.clear()
+    ex2.tap_combo([])
+    assert events == [], "空组合不该发键"
+    print("PASS combo_keys_dry_run_and_ordering")
+
+
 def main():
     test_buffer()
     test_delays()
@@ -990,6 +1036,7 @@ def main():
     test_modes_single_file_is_1x_equivalent()
     test_modes_multi_target_resets_between_files()
     test_modes_kill_stops_remaining_files()
+    test_combo_keys_dry_run_and_ordering()
     print("ALL SANITY CHECKS PASSED")
 
 
