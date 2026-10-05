@@ -20,6 +20,8 @@ from typing import Optional
 from .config import Config
 from .keymap import unsupported_chars
 from .machine import AutoTyper
+from .modes import (DEFAULT_EXTS, VSCODE_REQUIRED_SETTINGS, SingleFileMode,
+                    VSCodeMode, collect_targets)
 from .presets import PRESETS, preset_names
 
 # 用户数据（内容 / 设置 / 日志）放当前工作目录：安装后代码位于只读的
@@ -27,6 +29,11 @@ from .presets import PRESETS, preset_names
 BASE_DIR = os.getcwd()
 SOURCE_TXT = os.path.join(BASE_DIR, "source.txt")
 SETTINGS_JSON = os.path.join(BASE_DIR, "gui_settings.json")
+
+# 模式 -> 界面显示名。key 是 modes.py 里注册的模式名。
+MODE_LABELS = {"notepad": "单文件（任意编辑器）",
+               "vscode": "VSCode（目录多文件）"}
+MODE_ORDER = ["notepad", "vscode"]
 
 # --------------------------------------------------------------- 控件清单
 # unit: raw=原值, %=百分比(/100), ms=毫秒(/1000), min=分钟(*60)
@@ -71,6 +78,8 @@ class App(tk.Tk):
         self.labels = {}        # field -> 数值标签（程序化改值时要手动刷新）
         self.label_fmt = {}     # field -> 标签格式串
         self.q = queue.Queue()
+        # 模式：notepad（单文件）/ vscode（目录多文件）。见 modes.py。
+        self.mode_var = tk.StringVar(value=MODE_LABELS[MODE_ORDER[0]])
         # typer 在 _start() 里创建，可能一直是 None（还没开始过）。显式标注成
         # AutoTyper | None，否则类型检查器只会推成 None，_on_close 里的
         # self.typer.kill.set() 就报「kill 不是 None 的已知属性」。
@@ -85,6 +94,7 @@ class App(tk.Tk):
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        self.nb = nb
         self.tab_text = ttk.Frame(nb)
         self.tab_rhythm = ttk.Frame(nb)
         self.tab_pause = ttk.Frame(nb)
@@ -194,6 +204,44 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------- 运行页
     def _build_run_tab(self):
+        mf = ttk.Labelframe(self.tab_run, text="模式")
+        mf.pack(fill="x", padx=10, pady=(10, 6))
+        mrow = ttk.Frame(mf)
+        mrow.pack(fill="x", padx=8, pady=(6, 0))
+        ttk.Label(mrow, text="打字目标").pack(side="left")
+        self.mode_cb = ttk.Combobox(
+            mrow, textvariable=self.mode_var, state="readonly", width=24,
+            values=[MODE_LABELS[m] for m in MODE_ORDER])
+        self.mode_cb.pack(side="left", padx=6)
+        self.mode_cb.bind("<<ComboboxSelected>>", self._on_mode_change)
+
+        self.vs_panel = ttk.Frame(mf)
+        r1 = ttk.Frame(self.vs_panel)
+        r1.pack(fill="x", pady=2)
+        ttk.Label(r1, text="起始文件夹").pack(side="left")
+        self.src_dir_var = tk.StringVar(value=BASE_DIR)
+        ttk.Entry(r1, textvariable=self.src_dir_var, width=42)\
+            .pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(r1, text="浏览…", command=self._pick_dir)\
+            .pack(side="left")
+
+        r2 = ttk.Frame(self.vs_panel)
+        r2.pack(fill="x", pady=2)
+        ttk.Label(r2, text="扩展名").pack(side="left")
+        self.ext_var = tk.StringVar(value=",".join(DEFAULT_EXTS))
+        ttk.Entry(r2, textvariable=self.ext_var, width=42)\
+            .pack(side="left", padx=6, fill="x", expand=True)
+
+        r3 = ttk.Frame(self.vs_panel)
+        r3.pack(fill="x", pady=(2, 0))
+        ttk.Label(r3, text="最多处理").pack(side="left")
+        self.max_files_var = tk.IntVar(value=0)
+        ttk.Spinbox(r3, from_=0, to=9999, textvariable=self.max_files_var,
+                    width=6).pack(side="left", padx=6)
+        ttk.Label(r3, foreground="#666",
+                  text="个文件（0 = 全部）。⚠ 中断会留下半截文件，"
+                       "建议先在 git 仓库里跑。").pack(side="left", padx=6)
+
         top = ttk.Labelframe(self.tab_run, text="预设人设")
         top.pack(fill="x", padx=10, pady=(10, 6))
         self.preset_var = tk.StringVar(value="标准")
@@ -301,6 +349,10 @@ class App(tk.Tk):
         data["_countdown"] = self.cd_var.get()
         data["_long_on"] = self.long_on_var.get()
         data["_window"] = self.window_var.get()
+        data["_mode"] = self.mode_var.get()
+        data["_src_dir"] = self.src_dir_var.get()
+        data["_ext"] = self.ext_var.get()
+        data["_max_files"] = self.max_files_var.get()
         try:
             with open(SETTINGS_JSON, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
@@ -324,9 +376,49 @@ class App(tk.Tk):
                 self.long_on_var.set(bool(v))
             elif k == "_window":
                 self.window_var.set(str(v))
+            elif k == "_mode":
+                if str(v) in MODE_LABELS.values():
+                    self.mode_var.set(str(v))
+            elif k == "_src_dir":
+                self.src_dir_var.set(str(v))
+            elif k == "_ext":
+                self.ext_var.set(str(v))
+            elif k == "_max_files":
+                self.max_files_var.set(int(v))
             elif k in self.vars:
                 self.vars[k].set(float(v))
         self._sync_labels()
+        self._on_mode_change()      # 让页签可见性与模式对齐
+
+    # ------------------------------------------------------------ 模式
+    def current_mode(self) -> str:
+        """当前选中的模式名（"notepad" / "vscode"）。"""
+        for name in MODE_ORDER:
+            if MODE_LABELS[name] == self.mode_var.get():
+                return name
+        return MODE_ORDER[0]
+
+    def _on_mode_change(self, event=None):
+        """切换模式。VSCode 模式下内容来自磁盘，「内容」页没意义，隐藏它。"""
+        if self.current_mode() == "vscode":
+            if not self.vs_panel.winfo_manager():
+                self.vs_panel.pack(fill="x", padx=8, pady=(6, 6))
+            # 隐藏而不是禁用：禁用的控件会让人以为还能用。
+            # 注意 hide() 之后 nb.index() 仍返回原下标（实测），所以判断
+            # 可见性必须看 state，不能看 index。
+            self.nb.hide(self.tab_text)
+            self.status.set("VSCode 模式：内容来自磁盘文件，无需填写「内容」页")
+        else:
+            if self.vs_panel.winfo_manager():
+                self.vs_panel.pack_forget()
+            if self.nb.tab(self.tab_text, "state") == "hidden":
+                self.nb.add(self.tab_text, text="📝 内容")   # 放回第 0 页
+            self.status.set("单文件模式：在「内容」页填写要输入的文字")
+
+    def _pick_dir(self):
+        d = filedialog.askdirectory(title="选择要处理的起始文件夹")
+        if d:
+            self.src_dir_var.set(d)
 
     # ------------------------------------------------------------ 运行
     def _log_line(self, line):
@@ -336,36 +428,31 @@ class App(tk.Tk):
         self.log.configure(state="disabled")
 
     def _start(self):
-        src_text = self.txt.get("1.0", "end").rstrip("\n")
-        if not src_text.strip():
-            messagebox.showerror("没有内容",
-                                 "请先在「内容」页填写要输入的文字。")
-            return
-        bad = unsupported_chars(src_text)
-        if bad:
-            shown = "，".join(f"{i}:{ch!r}" for i, ch in bad[:5])
-            messagebox.showerror(
-                "含无法键入的字符",
-                f"文本里有 {len(bad)} 个无法可靠输入的控制字符（{shown}）。\n"
-                "请先删掉它们，单独的 \\r 请换成换行。")
-            return
         import random as _random
         cfg = self._collect_config()
-        typer = AutoTyper(cfg, src_text, rng=_random.Random())
+        if self.current_mode() == "vscode":
+            typer = self._make_vscode_typer(cfg, _random)
+        else:
+            typer = self._make_single_typer(cfg, _random)
+        if typer is None:
+            return                  # 已弹错误并中止
         self.typer = typer
 
         orig_progress = typer._progress
 
         def patched_progress():
             orig_progress()
-            pct = 100.0 * typer.pipeline.i / max(1, len(src_text))
-            self.q.put(("pct", pct))
+            # VSCode 模式的进度由 progress_hook 逐文件推送；这里只在单文件
+            # 模式下更新字符级进度条（多文件时"当前文件内的百分比"会误导）。
+            if self.current_mode() != "vscode":
+                self.q.put(("pct", 100.0 * typer.pipeline.i
+                            / max(1, len(typer.source))))
 
         typer._progress = patched_progress
 
         self._set_running(True)
         self._run_started = time.time()
-        self._src_len = len(src_text)
+        self._src_len = len(typer.source) if typer.source else 1
         self.progress["value"] = 0
         typer.executor.start()          # 倒计时期间 F10 也能中止
         n = self.cd_var.get()
@@ -373,6 +460,64 @@ class App(tk.Tk):
             self._countdown(typer, n)
         else:
             self._launch_worker(typer)
+
+    def _make_single_typer(self, cfg, rng_module):
+        """单文件模式。返回 None 表示已弹错误并中止。"""
+        src_text = self.txt.get("1.0", "end").rstrip("\n")
+        if not src_text.strip():
+            messagebox.showerror("没有内容",
+                                 "请先在「内容」页填写要输入的文字。")
+            return None
+        bad = unsupported_chars(src_text)
+        if bad:
+            shown = "，".join(f"{i}:{ch!r}" for i, ch in bad[:5])
+            messagebox.showerror(
+                "含无法键入的字符",
+                f"文本里有 {len(bad)} 个无法可靠输入的控制字符（{shown}）。\n"
+                "请先删掉它们，单独的 \\r 请换成换行。")
+            return None
+        mode = SingleFileMode(src_text, "内容页")
+        return AutoTyper(cfg, src_text, rng=rng_module.Random(), mode=mode)
+
+    def _make_vscode_typer(self, cfg, rng_module):
+        """VSCode 模式：枚举目录 + preflight。返回 None 表示已弹错误并中止。
+
+        preflight 的结果**必须**用对话框展示：命令行会把可复制的 settings.json
+        片段打到 stdout，而 GUI 用户根本看不到 stdout。
+        """
+        exts = [e.strip() for e in self.ext_var.get().split(",") if e.strip()]
+        if not exts:
+            messagebox.showerror("扩展名为空",
+                                 "请至少填写一个扩展名，例如 .py")
+            return None
+        src_dir = self.src_dir_var.get().strip() or BASE_DIR
+        mode = VSCodeMode(src_dir, exts=exts,
+                          max_files=self.max_files_var.get())
+        try:
+            targets = collect_targets(mode)
+        except ValueError as exc:
+            self._show_preflight_error(str(exc))
+            return None
+        # 逐文件进度：done/total/path
+        cfg.progress_hook = lambda done, total, t: self.q.put(
+            ("file", (done, total, t.path)))
+        return AutoTyper(cfg, "", rng=rng_module.Random(), mode=mode,
+                         targets=targets)
+
+    def _show_preflight_error(self, detail):
+        """把 preflight 的问题 + 可复制的 settings.json 片段弹给用户。"""
+        snippet = "\n".join(
+            f'  "{k}": {json.dumps(v)},'
+            for k, (v, _) in VSCODE_REQUIRED_SETTINGS.items())
+        box = ("请先解决下面的问题再开始：\n\n"
+               f"{detail}\n\n"
+               "其中 VSCode 设置项需要改成这样（放进 settings.json）：\n"
+               f"{snippet}\n\n"
+               "改完再点「开始真实输入」。")
+        self._log_line("=== 预检未通过 ===")
+        for ln in detail.splitlines():
+            self._log_line("  " + ln)
+        messagebox.showerror("无法启动（预检未通过）", box)
 
     def _countdown(self, typer, n):
         """开始前的等待，给用户切窗口的时间；每一秒都检查停止请求。"""
@@ -484,6 +629,13 @@ class App(tk.Tk):
                 if kind == "pct":
                     self.progress["value"] = payload
                     # 状态栏交给 _tick 统一维护（带 ETA / 当前状态），这里不动
+                elif kind == "file":
+                    # VSCode 模式：进度条按「已完成文件数」走。多文件下单个
+                    # 文件内部的字符进度本就不可信（缓冲区不等于文档），用它
+                    # 画百分比反而误导。
+                    done, total, path = payload
+                    self.progress["value"] = 100.0 * done / max(1, total)
+                    self.status.set(f"文件 {done + 1}/{total}：{path}")
                 elif kind == "error":
                     self._set_running(False)
                     self._log_line("出错，已停止：")
@@ -493,28 +645,69 @@ class App(tk.Tk):
                 elif kind == "done":
                     s = payload
                     self._set_running(False)
-                    if s["final_matches_source"]:
+                    if s.get("final_matches_source"):
                         self.progress["value"] = 100
-                    for ln in (
-                        f"chars={s['chars']} errors={s['errors']} "
-                        f"bursts={s['bursts']} edits={s['edits']} "
-                        f"rewrites={s['rewrites']} reviews={s['reviews']} "
-                        f"pauses={s['pause_count']}",
-                        f"内容一致: {s['final_matches_source']}  "
-                        f"耗时 {s['elapsed_s']}s"
-                        + ("（被停止）" if s["killed"] else ""),
-                    ):
-                        self._log_line(ln)
-                    if s["killed"]:
-                        self.status.set("已停止")
-                    elif s["final_matches_source"]:
-                        self.status.set("完成 ✓ 内容一致")
+                    if "per_file" in s:
+                        self._report_per_file(s)
                     else:
-                        self.status.set("结束，但内容与源文本不一致（看日志）")
+                        self._report_single(s)
         except queue.Empty:
             pass
         if self.running:
             self._poll_id = self.after(120, self._poll_queue)
+
+    def _report_single(self, s):
+        """单文件模式的结束汇报。"""
+        for ln in (
+                f"chars={s['chars']} errors={s['errors']} "
+                f"bursts={s['bursts']} edits={s['edits']} "
+                f"rewrites={s['rewrites']} reviews={s['reviews']} "
+                f"pauses={s['pause_count']}",
+                f"内容一致: {s['final_matches_source']}  "
+                f"耗时 {s['elapsed_s']}s"
+                + ("（被停止）" if s["killed"] else ""),
+        ):
+            self._log_line(ln)
+        if s["killed"]:
+            self.status.set("已停止")
+        elif s["final_matches_source"]:
+            self.status.set("完成 ✓ 内容一致")
+        else:
+            self.status.set("结束，但内容与源文本不一致（看日志）")
+
+    def _report_per_file(self, s):
+        """VSCode 模式的结束汇报：**失败文件置顶**，明细全列在日志区。
+
+        这么定的理由：多文件场景下一个总的 bool 没有排查价值——用户真正需要
+        的是"哪个文件坏了、坏在哪一行"，而这正是 detail 里已有的信息。置顶
+        失败项是为了让它不用往下翻日志就能看见。
+        """
+        per = s.get("per_file") or []
+        failed = [f for f in per if f.get("ok") is False]
+        skipped = [f for f in per if f.get("ok") is None]
+        ok = [f for f in per if f.get("ok") is True]
+
+        self._log_line(f"chars={s['chars']} errors={s['errors']} "
+                       f"edits={s['edits']} rewrites={s['rewrites']}  "
+                       f"耗时 {s['elapsed_s']}s"
+                       + ("（被停止）" if s["killed"] else ""))
+        for f in failed:
+            self._log_line(f"  [FAIL] {f['path']}  {f.get('detail', '')}")
+        for f in skipped:
+            self._log_line(f"  [SKIP] {f['path']}  {f.get('detail', '')}")
+        for f in ok:
+            self._log_line(f"  [OK  ] {f['path']}")
+
+        n_ok, n_bad, n_skip = len(ok), len(failed), len(skipped)
+        if s["killed"]:
+            self.status.set(f"已停止（完成 {n_ok} / 失败 {n_bad}）")
+        elif n_bad:
+            self.status.set(f"⚠ {n_bad} 个文件不一致，{n_ok} 个成功（看日志）")
+        elif n_skip and not n_ok:
+            self.status.set(f"{n_skip} 个文件均未校验（未发键？）")
+        else:
+            self.progress["value"] = 100
+            self.status.set(f"完成 ✓ {n_ok} 个文件均一致")
 
     def _set_running(self, running):
         self.running = running
@@ -547,6 +740,7 @@ def selftest():
     真正的 gui_settings.json —— 设置读写全部改走临时文件。
     """
     global SETTINGS_JSON
+    import random
     import tempfile
     SETTINGS_JSON = os.path.join(tempfile.gettempdir(),
                                 "autotyper_selftest_settings.json")
@@ -599,6 +793,110 @@ def selftest():
     assert not app.running, "结束后界面没有复位"
     assert str(app.btn_start["state"]) == "normal"
     assert "内容一致: True" in app.log.get("1.0", "end")
+    # --- 模式切换（VSCode 模式接入的核心） ---
+    assert app.current_mode() == "notepad", "默认必须是单文件模式"
+    app.mode_var.set(MODE_LABELS["vscode"])
+    app._on_mode_change()
+    app.update_idletasks()
+    assert app.current_mode() == "vscode"
+    assert app.vs_panel.winfo_manager(), "VSCode 面板应可见"
+    # 注意：hide() 之后 nb.index() 仍返回原下标，可见性只能看 state
+    assert app.nb.tab(app.tab_text, "state") == "hidden", \
+        "VSCode 下「内容」页应隐藏"
+    app.mode_var.set(MODE_LABELS["notepad"])
+    app._on_mode_change()
+    app.update_idletasks()
+    assert app.current_mode() == "notepad"
+    assert not app.vs_panel.winfo_manager(), "单文件下 VSCode 面板应隐藏"
+    assert app.nb.tab(app.tab_text, "state") == "normal", \
+        "单文件下「内容」页应恢复"
+    for _ in range(3):            # 反复切换必须幂等
+        app.mode_var.set(MODE_LABELS["vscode"])
+        app._on_mode_change()
+        app.mode_var.set(MODE_LABELS["notepad"])
+        app._on_mode_change()
+    app.update_idletasks()
+
+    # --- VSCode 模式：preflight 不过必须弹框（GUI 用户看不到 stdout） ---
+    shown = []
+    real_err = messagebox.showerror
+    messagebox.showerror = lambda title, msg: shown.append((title, msg))
+    ok_dir = os.path.join(tempfile.gettempdir(), "_gui_vs_ok")
+    try:
+        app.mode_var.set(MODE_LABELS["vscode"])
+        app._on_mode_change()
+        app.ext_var.set(".py")
+        app.max_files_var.set(0)
+        app.src_dir_var.set(os.path.join(tempfile.gettempdir(),
+                                         "_no_such_dir_xyz"))
+        assert app._make_vscode_typer(app._collect_config(),
+                                      random) is None, \
+            "目录不存在时不该构造 typer"
+        assert shown, "preflight 失败必须弹框"
+        assert "预检" in shown[-1][0]
+        assert "editor.autoIndent" in shown[-1][1], \
+            "弹框必须给出可复制的 settings.json 片段"
+
+        # 合规配置下应构造成功，且 targets / progress_hook 就位
+        os.makedirs(os.path.join(ok_dir, ".vscode"), exist_ok=True)
+        with open(os.path.join(ok_dir, "g.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        with open(os.path.join(ok_dir, ".vscode", "settings.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump({k: v for k, (v, _) in
+                       VSCODE_REQUIRED_SETTINGS.items()}, f)
+        shown.clear()
+        app.src_dir_var.set(ok_dir)
+        cfg2 = app._collect_config()
+        ty = app._make_vscode_typer(cfg2, random)
+        assert ty is not None, f"合规配置下应构造成功: {shown}"
+        assert not shown, f"不该报错: {shown}"
+        assert ty.targets, "targets 应非空"
+        assert ty.mode is not None and ty.mode.multi_target is True
+        assert cfg2.progress_hook is not None, "必须装上逐文件进度回调"
+
+        # 扩展名为空要拦下
+        shown.clear()
+        app.ext_var.set("  ,  ")
+        assert app._make_vscode_typer(app._collect_config(), random) is None
+        assert shown and "扩展名" in shown[-1][1]
+    finally:
+        messagebox.showerror = real_err
+        app.ext_var.set(",".join(DEFAULT_EXTS))
+        app.mode_var.set(MODE_LABELS["notepad"])
+        app._on_mode_change()
+
+    # --- 逐文件汇报：失败置顶、状态栏点名 ---
+    per = {"chars": 100, "errors": 2, "edits": 0, "rewrites": 0,
+           "files": 3, "files_ok": 1, "files_unverified": 1, "elapsed_s": 5.0,
+           "killed": False, "verify_trustworthy": False,
+           "final_matches_source": None,
+           "per_file": [
+               {"path": "ok.py", "ok": True, "detail": "", "chars": 30},
+               {"path": "bad.py", "ok": False,
+                "detail": "第 3 行第 2 列开始不一致", "chars": 40},
+               {"path": "skip.py", "ok": None,
+                "detail": "dry-run 未发键", "chars": 30},
+           ]}
+    app._set_running(True)
+    app.q.put(("done", per))
+    app._poll_queue()
+    logtxt = app.log.get("1.0", "end")
+    assert not app.running, "结束后界面没有复位"
+    assert "[FAIL] bad.py" in logtxt and "第 3 行第 2 列" in logtxt
+    assert "[SKIP] skip.py" in logtxt and "[OK  ] ok.py" in logtxt
+    assert logtxt.index("[FAIL]") < logtxt.index("[OK  ]"), "FAIL 必须置顶"
+    assert "1 个文件不一致" in app.status.get(), app.status.get()
+
+    app._set_running(True)
+    app.q.put(("done", dict(per, files_ok=2, files_unverified=0,
+                            per_file=[{"path": "a.py", "ok": True,
+                                       "detail": ""},
+                                      {"path": "b.py", "ok": True,
+                                       "detail": ""}])))
+    app._poll_queue()
+    assert "2 个文件均一致" in app.status.get(), app.status.get()
+
     app._set_running(True)
     app.q.put(("error", "Traceback (most recent call last):\n  boom"))
     app._poll_queue()
