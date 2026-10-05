@@ -1127,6 +1127,118 @@ def test_vscode_preflight_blocks_bad_setup():
     print("PASS vscode_preflight_blocks_bad_setup")
 
 
+def test_vscode_verify_reports_diff():
+    """回读校验必须报出**第一个差异的行号**，否则多文件场景无法排查。"""
+    from .modes import VSCodeMode
+
+    m = VSCodeMode(".")
+
+    # 完全一致
+    assert m._diff("abc\ndef\n", "abc\ndef\n", "x.py")["ok"] is True
+
+    # 中间某行不同 -> 要指出正确的行号
+    r = m._diff("a\nb\nc\n", "a\nb\nX\n", "x.py")
+    assert r["ok"] is False
+    assert r["line"] == 3, f"行号算错: {r}"
+    assert "x.py" in r["detail"] and "第 3 行" in r["detail"]
+
+    # 缺字符（实际被截断）-> 长度不同，不能报成"某行不一致"
+    r2 = m._diff("a\nb\nc\n", "a\nb\n", "y.py")
+    assert r2["ok"] is False
+    assert "长度不同" in r2["detail"], r2["detail"]
+
+    # 多出来一行
+    r3 = m._diff("a\n", "a\nb\n", "z.py")
+    assert r3["ok"] is False and "长度不同" in r3["detail"]
+
+    # 列号：第 2 行第 3 列
+    r4 = m._diff("hello\nworld\n", "hello\nWORLD\n", "w.py")
+    assert r4["line"] == 2 and r4["col"] == 1, r4
+
+    # 读不回文件时必须 ok=False 而不是抛异常
+    assert m._read_back(_FakeTarget(abs_path=None)) is None
+    print("PASS vscode_verify_reports_diff")
+
+
+class _FakeTarget:
+    """只给 _read_back 用的最小 Target 替身（没有 abs_path 就该返回 None）。"""
+    def __init__(self, abs_path=None):
+        self.abs_path = abs_path
+
+
+def test_vscode_reread_matches_disk():
+    """after_type 必须以磁盘为准：文件没被改动时不能谎报成功。"""
+    from .modes import VSCodeMode, Target
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "reread.py")
+        want = "print('hi')\n"
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(want)
+        m = VSCodeMode(d, settings_paths=[], save_settle_s=0.0)
+        t = Target(path="reread.py", content=want, abs_path=path)
+
+        class FakeTyper:
+            pass
+        ty = FakeTyper()
+        ty.cfg = fast_cfg()               # dry_run=True -> 不发 Ctrl+S
+        ty.executor = None
+
+        # 磁盘内容 == 期望 -> 通过
+        res = m.after_type(t, ty)
+        assert res["ok"] is True, res
+
+        # 磁盘被改坏 -> 必须抓到，且指出行号
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("print('HI')\n")
+        res2 = m.after_type(t, ty)
+        assert res2["ok"] is False, "磁盘内容不一致时不该报成功"
+        assert res2["line"] == 1, res2
+
+        # CRLF 归一后仍应判定一致（编辑器可能写 CRLF）
+        with open(path, "wb") as f:
+            f.write(b"print('hi')\r\n")
+        assert m.after_type(t, ty)["ok"] is True, "CRLF 应归一后视为一致"
+    print("PASS vscode_reread_matches_disk")
+
+
+def test_vscode_strips_bom():
+    """回归：带 BOM 的源文件不能把 U+FEFF 当成内容。
+
+    BOM 若混进 content，会成为首字符 U+FEFF——它打不出来（KeyCode.from_char
+    返回 None，type_char 静默跳过而 buffer 照样记账），而且 0xFEFF > 0x20，
+    unsupported_chars 抓不到。只能靠 utf-8-sig 读时剥掉。
+    """
+    from .modes import VSCodeMode
+    from .main import read_source
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "bom.py")
+        with open(p, "wb") as f:
+            f.write(b"\xef\xbb\xbfprint('x')\n")          # 带 BOM
+        assert open(p, "rb").read()[:3] == b"\xef\xbb\xbf"
+
+        m = VSCodeMode(d, settings_paths=[])
+        t = m.iter_targets()[0]
+        assert "\ufeff" not in t.content, f"BOM 未被剥掉: {t.content!r}"
+        assert t.content == "print('x')\n"
+        assert not t.content.startswith("\ufeff")
+
+        # CLI 的 --file 走 read_source，同样不能带 BOM
+        assert read_source(p) == "print('x')\n"
+
+        # 回读也要剥：编辑器写回带 BOM 的文件时应判定为一致
+        from .modes import Target
+        m2 = VSCodeMode(d, settings_paths=[], save_settle_s=0.0)
+        ty = type("T", (), {})()
+        ty.cfg = fast_cfg()
+        ty.executor = None
+        res = m2.after_type(Target(path="bom.py", content="print('x')\n",
+                                  abs_path=p), ty)
+        assert res["ok"] is True, res
+    print("PASS vscode_strips_bom")
+
+
 def main():
     test_buffer()
     test_delays()
@@ -1165,6 +1277,9 @@ def main():
     test_combo_keys_dry_run_and_ordering()
     test_vscode_enumeration()
     test_vscode_preflight_blocks_bad_setup()
+    test_vscode_verify_reports_diff()
+    test_vscode_reread_matches_disk()
+    test_vscode_strips_bom()
     print("ALL SANITY CHECKS PASSED")
 
 

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import sys
@@ -7,7 +8,8 @@ import time
 from .config import Config
 from .keymap import unsupported_chars
 from .machine import AutoTyper
-from .modes import SingleFileMode, get_mode, mode_names
+from .modes import (DEFAULT_EXTS, VSCODE_REQUIRED_SETTINGS, SingleFileMode,
+                    VSCodeMode, collect_targets, get_mode, mode_names)
 from .presets import PRESETS, apply_preset, describe, preset_names
 
 DEMO_SOURCE = '''def compute_stats(numbers):
@@ -51,8 +53,12 @@ if __name__ == "__main__":
 
 def read_source(path):
     """读入源文本。\r\n 与单独的 \r 一律归一成 \n——否则缓冲区里记的是 \r，
-    而编辑器收到的是回车键，两边就此错位。"""
-    with open(path, "r", encoding="utf-8") as f:
+    而编辑器收到的是回车键，两边就此错位。
+
+    用 utf-8-sig 顺带剥掉 UTF-8 BOM：BOM 会变成内容首字符 U+FEFF，而它
+    打不出来（见 modes.py::VSCodeMode._make_target 的说明）。
+    """
+    with open(path, "r", encoding="utf-8-sig") as f:
         return f.read().replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -91,7 +97,36 @@ def parse_args(argv):
     p.add_argument("--mode", default="notepad", metavar="NAME",
                    help=f"typing mode, one of: {', '.join(mode_names())} "
                         "(default: notepad; --mode list for details)")
+    p.add_argument("--src-dir", default=".",
+                   help="vscode mode: source directory to enumerate")
+    p.add_argument("--ext", default=",".join(DEFAULT_EXTS), metavar="LIST",
+                   help="vscode mode: comma-separated extensions to include")
+    p.add_argument("--max-files", type=int, default=0,
+                   help="vscode mode: only process the first N files (0 = all)")
     return p.parse_args(argv)
+
+
+def _build_mode(args):
+    """按 --mode 构造模式实例。多目标模式在这里枚举 + preflight。
+
+    返回 (mode, targets)；targets 为 None 表示单文档路径（notepad），
+    此时 source/source_desc 已由调用方准备好。
+    """
+    if args.mode == "vscode":
+        exts = [e.strip() for e in args.ext.split(",") if e.strip()]
+        mode = VSCodeMode(args.src_dir, exts=exts, max_files=args.max_files)
+        try:
+            targets = collect_targets(mode)
+        except ValueError as exc:
+            print("ERROR: 无法启动 VSCode 模式：")
+            for line in str(exc).splitlines():
+                print(f"  - {line}")
+            print("\n提示：把下面的配置加进 VSCode 的 settings.json 后重试：")
+            for k, (v, why) in VSCODE_REQUIRED_SETTINGS.items():
+                print(f'  "{k}": {json.dumps(v)},   # 否则{why}')
+            raise SystemExit(1)
+        return mode, targets
+    return SingleFileMode(None), None
 
 
 def main(argv=None):
@@ -132,33 +167,47 @@ def main(argv=None):
               f"(or --preset list for details)")
         return 1
     overridden = apply_preset(cfg, args.preset)
-    source = DEMO_SOURCE
-    source_desc = "built-in demo"
-    if args.file:
-        source = read_source(args.file)
-        source_desc = args.file
+
+    # 多目标模式自己枚举文件，不走单文档的 source 读取 / 字符集校验
+    typer_mode, targets = _build_mode(args)
+
+    if targets is None:
+        source = DEMO_SOURCE
+        source_desc = "built-in demo"
+        if args.file:
+            source = read_source(args.file)
+            source_desc = args.file
+        else:
+            # default: read ./source.txt in the current working directory
+            default_txt = "source.txt"
+            if os.path.exists(default_txt):
+                source = read_source(default_txt)
+                source_desc = default_txt
+        problem = source_problem(source)
+        if problem:
+            print(f"ERROR: {problem}")
+            return 1
+        typer_mode = SingleFileMode(source, source_desc)
     else:
-        # default: read ./source.txt in the current working directory
-        default_txt = "source.txt"
-        if os.path.exists(default_txt):
-            source = read_source(default_txt)
-            source_desc = default_txt
-    problem = source_problem(source)
-    if problem:
-        print(f"ERROR: {problem}")
-        return 1
+        source = ""
+        source_desc = f"{args.src_dir} ({args.ext})"
 
     rng = random.Random(args.seed)
-    # 模式：目前只有 notepad（单文件），它就是 1.x 的原行为。多目标模式
-# （VSCode 等）由 mode.iter_targets() 提供 targets 并置 multi_target。
-    typer_mode = SingleFileMode(source, source_desc)
-    typer = AutoTyper(cfg, source, rng=rng, mode=typer_mode)
+    if targets is None:
+        typer = AutoTyper(cfg, source, rng=rng, mode=typer_mode)
+    else:
+        # 多目标模式：source 由每个 Target 各自提供，这里传空串占位
+        typer = AutoTyper(cfg, "", rng=rng, mode=typer_mode, targets=targets)
 
     run_mode = "LIVE" if not cfg.dry_run else "DRY-RUN"
-    print(f"mode={run_mode} type_mode={args.mode} chars={len(source)} "
+    n_desc = f"{len(targets)} file(s)" if targets is not None else \
+        f"chars={len(source)}"
+    print(f"mode={run_mode} type_mode={args.mode} {n_desc} "
           f"speed={cfg.speed_multiplier}x "
           f"kill_hotkey={cfg.kill_hotkey.upper()}")
     print(f"source: {source_desc}")
+    for w in typer_mode.editor_warnings():
+        print(f"WARNING: {w}")
     print(f"preset: {args.preset} ({describe(args.preset)}, "
           f"{overridden} fields)")
     if not cfg.dry_run:
@@ -183,6 +232,13 @@ def main(argv=None):
     print()
     print("=== summary ===")
     for k, v in summary.items():
+        if k == "per_file":
+            # 逐文件结论单独列：多文件场景下 bool 汇总没有排查价值
+            print(f"per_file ({len(v)}):")
+            for f in v:
+                mark = "OK  " if f.get("ok") else "FAIL"
+                print(f"  [{mark}] {f.get('path')}  {f.get('detail', '')}")
+            continue
         print(f"{k}: {v}")
     return 0 if not summary.get("killed") else 130
 

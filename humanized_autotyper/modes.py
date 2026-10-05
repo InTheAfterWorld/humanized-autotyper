@@ -14,6 +14,7 @@ AutoTyper 的主循环 (`machine.py::AutoTyper.run`) 本身不认识"文档"也�
 """
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -158,7 +159,8 @@ class VSCodeMode(Mode):
     multi_target = True
 
     def __init__(self, src_dir: str, exts=None, rel_prefix: str = "",
-                 settings_paths=None, max_files: int = 0):
+                 settings_paths=None, max_files: int = 0,
+                 open_settle_s: float = 0.6, save_settle_s: float = 0.8):
         self.src_dir = src_dir
         self.exts = tuple(e if e.startswith(".") else "." + e
                           for e in (exts or DEFAULT_EXTS))
@@ -166,7 +168,13 @@ class VSCodeMode(Mode):
         self.settings_paths = list(settings_paths
                                   if settings_paths is not None
                                   else self._default_settings())
+        # 显式传入时 settings_paths 优先（见 settings_for）
+        self._explicit_settings = settings_paths is not None
         self.max_files = max_files
+        # Quick Open 是**实时过滤**的：路径一敲完就得给它收敛时间，否则
+        # 紧接着的 Enter 可能打开匹配到一半的那个文件。
+        self.open_settle_s = open_settle_s
+        self.save_settle_s = save_settle_s
         self._settings_cache: Optional[Dict[str, Any]] = None
 
     @staticmethod
@@ -200,8 +208,12 @@ class VSCodeMode(Mode):
     def _make_target(self, dirpath, filename) -> Target:
         abs_path = os.path.join(dirpath, filename)
         try:
-            with open(abs_path, "r", encoding="utf-8") as f:
-                content = f.read()
+                # utf-8-sig：源文件常带 UTF-8 BOM。若用纯 utf-8 读，BOM 会变成
+                # 内容首字符 U+FEFF——它**打不出来**（KeyCode.from_char 返回
+                # None，type_char 静默跳过而 buffer 照样记录），且 0xFEFF > 0x20
+                # 所以 unsupported_chars 也抓不到。只能在这里剥掉。
+                with open(abs_path, "r", encoding="utf-8-sig") as f:
+                    content = f.read()
         except (UnicodeDecodeError, OSError) as exc:
             # 读不出来的文件不该让整轮失败：标记出来，preflight 会报
             return Target(path=self._rel(abs_path), content="",
@@ -227,14 +239,30 @@ class VSCodeMode(Mode):
         return rel.replace("\\", "/")
 
     # ---------------------------------------------------------- preflight
+    def settings_for(self) -> List[str]:
+        """本项目要读哪些 settings.json。
+
+        显式传入 settings_paths 时以它为准（测试用）。否则查 User 级 +
+        **当前工作目录**的 .vscode/settings.json；但当 --src-dir 指向别处时，
+        工作区设置应该跟着 src_dir 走——否则会误判 "未设置"。
+        """
+        if self._explicit_settings:
+            return self.settings_paths
+        local = os.path.join(self.src_dir, ".vscode", "settings.json")
+        if os.path.isdir(self.src_dir) and os.path.exists(local):
+            return self._default_settings()[:-1] + [local]
+        return self._default_settings()
+
     def _read_settings(self) -> Dict[str, Any]:
         """合并所有层级的 settings.json，后读到的覆盖先读到的。"""
         if self._settings_cache is not None:
             return self._settings_cache
         merged: Dict[str, Any] = {}
-        for path in self.settings_paths:
+        for path in self.settings_for():
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                # utf-8-sig：VSCode / PowerShell 写出的 settings.json 常带 BOM，
+                # 用纯 utf-8 读会直接 JSONDecodeError，误判成"配置损坏"。
+                with open(path, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
             except FileNotFoundError:
                 continue
@@ -286,6 +314,76 @@ class VSCodeMode(Mode):
 
     def verify_trustworthy(self) -> bool:
         return False
+
+    # ------------------------------------------------------ 定位 / 存盘 / 校验
+    def before_type(self, target: Target, typer) -> None:
+        """Ctrl+P 打开目标文件，并把文档清空到起始状态。
+
+        清空是必须的：Quick Open 只是**切换**到已打开的标签页，光标还停在
+        上次的位置，文档里也留着上次的内容。若不清空，打出来的文本会插到
+        旧内容中间。
+        """
+        ex = typer.executor
+        if getattr(typer.cfg, "dry_run", True):
+            return                      # dry-run 不发键，但流程照走以便审计
+        if self.rel_prefix:
+            # src_dir 不是工作区根目录时，Quick Open 需要带前缀
+            quick_path = f"{self.rel_prefix}/{target.path}"
+        else:
+            quick_path = target.path
+        ex.key_quick_open()
+        typer._sleep(self.open_settle_s, active=False)
+        for ch in quick_path:
+            ex.type_char(ch)
+            typer._sleep(self.open_settle_s / max(1, len(quick_path)),
+                         active=False)
+        # 关键：等 Quick Open 过滤收敛，否则 Enter 可能打开半匹配的文件
+        typer._sleep(self.open_settle_s, active=False)
+        ex._tap_special("return")
+        typer._sleep(self.open_settle_s, active=False)
+
+    def after_type(self, target: Target, typer) -> Dict[str, Any]:
+        """Ctrl+S 存盘，等格式化落盘，然后回读磁盘做权威比对。"""
+        ex = typer.executor
+        if not getattr(typer.cfg, "dry_run", True):
+            ex.key_save()
+            typer._sleep(self.save_settle_s, active=False)
+        actual = self._read_back(target)
+        if actual is None:
+            return {"ok": False, "detail": "存盘后读不回文件（可能路径不对）"}
+        return self._diff(target.content, actual, target.path)
+
+    def _read_back(self, target: Target) -> Optional[str]:
+        if not target.abs_path:
+            return None
+        # 存盘是异步的（编辑器写盘有延迟），这里重试几次而不是干等一次
+        for _ in range(5):
+            try:
+                with open(target.abs_path, "r", encoding="utf-8-sig") as f:
+                    return f.read().replace("\r\n", "\n").replace("\r", "\n")
+            except FileNotFoundError:
+                return None
+            except OSError:
+                pass
+            time.sleep(0.2)
+        return None
+
+    @staticmethod
+    def _diff(expected: str, actual: str, path: str) -> Dict[str, Any]:
+        """逐字符比对，报告第一个差异的行号——定位到行才有排查价值。"""
+        if expected == actual:
+            return {"ok": True, "detail": ""}
+        n = min(len(expected), len(actual))
+        i = 0
+        while i < n and expected[i] == actual[i]:
+            i += 1
+        line = expected.count("\n", 0, i) + 1
+        col = i - (expected.rfind("\n", 0, i) + 1) + 1
+        detail = (f"{path}: 第 {line} 行第 {col} 列开始不一致 "
+                  f"(期望 {expected[i]!r}，实际 {actual[i]!r})"
+                  if i < n else
+                  f"{path}: 长度不同（期望 {len(expected)}，实际 {len(actual)}）")
+        return {"ok": False, "detail": detail, "line": line, "col": col}
 
 
 register_mode(VSCodeMode)
