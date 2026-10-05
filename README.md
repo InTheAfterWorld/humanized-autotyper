@@ -108,6 +108,7 @@ humanized_autotyper/       # 包本体
 ├── main.py        # CLI 入口（autotyper）：倒计时、窗口校验、调度循环
 ├── gui.py         # 图形界面（autotyper-gui）
 ├── report.py      # 事件日志审计：按运行分段 + 用该次真实 config 做 obs vs cfg
+├── modes.py       # 模式抽象：单文件 / VSCode（枚举、preflight、回读校验）
 ├── sanity_check.py # 全链路 dry-run 自检 + 单元验证
 └── validate.py    # 多种子批量验证 + kill 开关路径测试
 ```
@@ -147,6 +148,58 @@ autotyper-gui --selftest                   # 无界面 GUI 自检
 | `--log FILE` | CSV 事件日志路径（默认 `autotyper_log.csv`，**追加**写） |
 | `--fresh` | 启动时清空日志文件，而不是追加进去 |
 | `--verbose` | 逐事件打印到控制台 |
+| `--mode NAME` | 打字模式：`notepad`（默认，单文件）/ `vscode`（目录多文件）。`--mode list` 看全部 |
+| `--src-dir DIR` | vscode 模式：要处理的文件目录 |
+| `--ext LIST` | vscode 模式：逗号分隔的扩展名白名单 |
+| `--max-files N` | vscode 模式：只处理前 N 个文件（0 = 全部） |
+
+## 模式（modes）
+
+`AutoTyper` 的主循环不认识"文档"，只消费 `Target` 列表。模式负责回答三件事：
+写哪些内容（`iter_targets`）、怎么定位到编辑器（`before_type`）、
+写完怎么确认（`after_type` + `verify_trustworthy`）。
+
+| 模式 | 适用 | 校验方式 |
+|---|---|---|
+| `notepad` | 任意编辑器 / 记事本，单份文本 | 内存缓冲区自比（`final_matches_source`） |
+| `vscode` | VSCode，目录下多个文件 | **存盘后回读磁盘逐字符比对** |
+
+### VSCode 模式
+
+```bash
+# 1) 先看需要改哪些配置（dry-run 最稳）
+autotyper --mode vscode --src-dir ./src --ext .py --dry-run
+
+# 2) 确认 VSCode 已按提示关掉自动行为，再实机跑
+autotyper --mode vscode --src-dir ./src --ext .py --live --window "Visual Studio Code"
+```
+
+**启动前必须先满足**（preflight 会逐项检查，不满足直接拒绝启动）：
+
+```jsonc
+{
+  "editor.autoIndent": "none",          // 否则自动缩进，缓冲区与文档错位
+  "editor.autoClosingBrackets": "never", // 否则自动补括号
+  "editor.autoClosingQuotes": "never",
+  "editor.autoSurround": "never",
+  "editor.quickSuggestions": false,      // 否则建议框会吃掉 Enter
+  "editor.acceptSuggestionOnEnter": "off",
+  "editor.formatOnSave": false,          // 否则存盘重排，回读比对必不符
+  "editor.formatOnType": false,
+  "editor.detectIndentation": false      // 否则按内容猜 tab/space
+}
+```
+
+不满足时命令会打印可直接复制的配置片段。
+
+> ⚠️ **与单文件模式的根本差异**：VSCode 会自动改写输入，且每个文件都会重置
+> 缓冲区，所以**内存缓冲区不再等于文档**。因此该模式下 `final_matches_source`
+> 会报 `None`，正确性只认 `per_file` 里逐文件回读磁盘的结果。
+> **F10 中断可能留下半截文件**，请在 git 仓库内运行。
+
+枚举规则：只收 `--ext` 白名单里的扩展名；跳过 `node_modules/`、`.git/`、
+`__pycache__/`、`dist/`、`build/`、`.venv/` 等目录以及所有隐藏文件/目录；
+路径统一正斜杠且相对 `--src-dir`（Quick Open 匹配的是工作区相对路径）。
 
 ## LIVE 模式安全清单
 
