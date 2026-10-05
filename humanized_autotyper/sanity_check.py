@@ -1,5 +1,7 @@
+import json
 import os
 import random
+import tempfile
 import time
 from typing import Any, Dict
 
@@ -1001,6 +1003,130 @@ def test_combo_keys_dry_run_and_ordering():
     print("PASS combo_keys_dry_run_and_ordering")
 
 
+def _make_vscode_tree(d):
+    """造一个临时项目树，含该跳过的和不该跳过的目录。"""
+    layout = {
+        "a.py": "print('a')\n",
+        "b.md": "# b\n",
+        "sub/c.py": "x = 1\n",
+        "node_modules/pkg/index.js": "module.exports = 1;\n",
+        ".git/config.py": "should be skipped\n",
+        "__pycache__/cached.py": "should be skipped\n",
+        "sub/.hidden.py": "should be skipped\n",
+        "binary.py": "\x00\x01binary\n",          # 扩展名对但内容含控制字符
+        "skip.bin": "ignored by ext\n",
+    }
+    for rel, content in layout.items():
+        full = os.path.join(d, *rel.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+    return d
+
+
+def test_vscode_enumeration():
+    """VSCode 模式枚举：只收白名单扩展名，跳过依赖/构建/隐藏目录。"""
+    from .modes import VSCodeMode, VSCODE_REQUIRED_SETTINGS
+
+    with tempfile.TemporaryDirectory() as d:
+        root = _make_vscode_tree(d)
+        m = VSCodeMode(root, settings_paths=[])
+        targets = m.iter_targets()
+        rels = sorted(t.path for t in targets)
+
+        assert any(p.endswith("a.py") for p in rels)
+        assert any(p.endswith("b.md") for p in rels)
+        assert any(p.replace("\\", "/").endswith("sub/c.py") for p in rels)
+        # 必须跳过的
+        for bad in ("node_modules", "__pycache__", ".hidden", "should be skipped"):
+            assert not any(bad in p for p in rels), f"不该收 {bad}: {rels}"
+        # 路径必须是正斜杠（Quick Open 用）
+        assert not any("\\" in p for p in rels), f"路径应统一正斜杠: {rels}"
+        # 必须相对 src_dir：Quick Open 匹配的是工作区相对路径，出现 ../.. 就废了
+        assert not any(".." in p for p in rels), \
+            f"路径不该含上级跳转: {rels}"
+        # 换行归一：\r\n -> \n
+        for t in targets:
+            assert "\r" not in t.content
+
+        # exts 过滤生效
+        m2 = VSCodeMode(root, exts=[".py"], settings_paths=[])
+        assert all(t.path.endswith(".py") for t in m2.iter_targets())
+        # 不带点的扩展名要自动补点
+        m3 = VSCodeMode(root, exts=["md"], settings_paths=[])
+        assert m3.exts == (".md",)
+        assert all(t.path.endswith(".md") for t in m3.iter_targets())
+        # max_files 截断
+        m4 = VSCodeMode(root, exts=[".py"], settings_paths=[], max_files=1)
+        assert len(m4.iter_targets()) == 1
+        # 直接给文件 -> 单目标
+        m5 = VSCodeMode(os.path.join(root, "a.py"), settings_paths=[])
+        assert len(m5.iter_targets()) == 1
+
+    assert VSCodeMode.multi_target is True
+    assert VSCodeMode("x").verify_trustworthy() is False, \
+        "VSCode 模式缓冲区不可信，必须返回 False"
+    assert len(VSCODE_REQUIRED_SETTINGS) >= 8
+    print(f"PASS vscode_enumeration files={len(rels)}")
+
+
+def test_vscode_preflight_blocks_bad_setup():
+    """preflight 必须拦住：设置没关干净、文件不可读、含控制字符。"""
+    from .modes import VSCodeMode, VSCODE_REQUIRED_SETTINGS
+
+    with tempfile.TemporaryDirectory() as d:
+        root = _make_vscode_tree(d)
+        settings = os.path.join(d, "settings.json")
+
+        # 1) settings.json 不存在 -> 所有必需项都要报错
+        m = VSCodeMode(root, settings_paths=[settings])
+        errs = m.preflight(m.iter_targets())
+        missing = [e for e in errs if "VSCode 设置" in e]
+        assert len(missing) == len(VSCODE_REQUIRED_SETTINGS), \
+            f"设置全缺时应逐项报错，实际 {len(missing)}"
+
+        # 2) 设置正确 -> 设置相关错误清零（binary.py 的控制字符仍会报）
+        good = {k: v for k, (v, _) in VSCODE_REQUIRED_SETTINGS.items()}
+        with open(settings, "w", encoding="utf-8") as f:
+            json.dump(good, f)
+        m2 = VSCodeMode(root, settings_paths=[settings])
+        errs2 = m2.preflight(m2.iter_targets())
+        assert not [e for e in errs2 if "VSCode 设置" in e], \
+            f"设置已合规却仍报错: {errs2}"
+        # 控制字符文件必须被单独拦下
+        assert [e for e in errs2 if "无法可靠键入" in e], \
+            f"binary.py 的控制字符应被拦: {errs2}"
+
+        # 3) workspace 覆盖 user：后读的层级赢
+        user = os.path.join(d, "user.json")
+        with open(user, "w", encoding="utf-8") as f:
+            json.dump({"editor.autoIndent": "full"}, f)
+        m3 = VSCodeMode(root, settings_paths=[user, settings])
+        errs3 = m3.preflight(m3.iter_targets())
+        # settings.json(autoIndent=none)在后，应覆盖 user 的 full
+        assert not [e for e in errs3 if "autoIndent" in e], \
+            f"后读层级应覆盖前面: {errs3}"
+
+        # 4) 反过来：workspace 设成 full，必须报错
+        bad_ws = os.path.join(d, "ws.json")
+        with open(bad_ws, "w", encoding="utf-8") as f:
+            json.dump({**good, "editor.autoIndent": "full"}, f)
+        m4 = VSCodeMode(root, settings_paths=[bad_ws])
+        assert [e for e in m4.preflight(m4.iter_targets()) if "autoIndent" in e]
+
+        # 5) 文件夹不存在
+        m5 = VSCodeMode(os.path.join(d, "nope"), settings_paths=[])
+        assert any("不存在" in e for e in m5.preflight(m5.iter_targets()))
+        # 6) 损坏的 settings.json 不能抛异常，要报出来
+        broken = os.path.join(d, "broken.json")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        m6 = VSCodeMode(root, settings_paths=[broken])
+        assert any("settings.json 读取失败" in e
+                   for e in m6.preflight(m6.iter_targets()))
+    print("PASS vscode_preflight_blocks_bad_setup")
+
+
 def main():
     test_buffer()
     test_delays()
@@ -1037,6 +1163,8 @@ def main():
     test_modes_multi_target_resets_between_files()
     test_modes_kill_stops_remaining_files()
     test_combo_keys_dry_run_and_ordering()
+    test_vscode_enumeration()
+    test_vscode_preflight_blocks_bad_setup()
     print("ALL SANITY CHECKS PASSED")
 
 

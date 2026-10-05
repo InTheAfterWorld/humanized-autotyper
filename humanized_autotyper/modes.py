@@ -12,6 +12,7 @@ AutoTyper 的主循环 (`machine.py::AutoTyper.run`) 本身不认识"文档"也�
 `SingleFileMode` 包装 1.x 的既有行为（单文件 / 内置 demo / source.txt），
 用于保证这一步重构**零功能变化**；后续 VSCode 模式只需要新增一个子类。
 """
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -112,3 +113,179 @@ def collect_targets(mode: Mode, source: Optional[str] = None,
     if problems:
         raise ValueError("\n".join(problems))
     return targets
+
+
+# --------------------------------------------------------------- VSCode 模式
+
+# VSCode 默认开启的这些行为会**偷偷改写输入**，让「缓冲区 = 文档」不变式失效，
+# 因此本模式要求把它们关掉。值与 VSCode settings.json 里写的字面量一致。
+VSCODE_REQUIRED_SETTINGS = {
+    "editor.autoIndent": ("none",
+                          "打字时会自动插入缩进，缓冲区与文档就此错位"),
+    "editor.autoClosingBrackets": ("never", "会自动补全括号/引号"),
+    "editor.autoClosingQuotes": ("never", "会自动补全引号"),
+    "editor.autoSurround": ("never", "选中文本后再输入会包一层"),
+    "editor.quickSuggestions": (False, "会弹建议框，下一个 Enter 可能采纳建议"),
+    "editor.acceptSuggestionOnEnter": ("off", "Enter 会接受代码补全建议"),
+    "editor.formatOnSave": (False, "存盘时自动格式化，回读比对必然不符"),
+    "editor.formatOnType": (False, "输入过程中自动格式化"),
+    "editor.detectIndentation": (False,
+                                 "会按文件已有内容猜 tab/space，不同文件会不一致"),
+}
+
+DEFAULT_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx", ".md", ".txt",
+                ".json", ".yaml", ".yml")
+
+# 这些目录永远跳过：依赖、构建产物、版本库里塞满无关文件
+SKIP_DIRS = frozenset({
+    "node_modules", ".git", ".svn", ".hg", "__pycache__", ".venv", "venv",
+    "dist", "build", "out", "target", ".next", ".nuxt", ".tox", ".mypy_cache",
+    ".pytest_cache", ".idea", ".vscode", "coverage", ".gradle", "vendor",
+})
+
+
+class VSCodeMode(Mode):
+    """把一个目录下的多个文件逐个打进 VSCode。
+
+    与 SingleFileMode 的根本差异：**内存缓冲区不再等于真实文档**。
+    VSCode 会自动缩进/补全/格式化（见 VSCODE_REQUIRED_SETTINGS），而且每个
+    文件都会重置缓冲区。因此本模式声明 verify_trustworthy() == False，
+    正确性只能靠 after_type() 存盘后回读磁盘来确认。
+    """
+
+    name = "vscode"
+    label = "VSCode（目录多文件）"
+    multi_target = True
+
+    def __init__(self, src_dir: str, exts=None, rel_prefix: str = "",
+                 settings_paths=None, max_files: int = 0):
+        self.src_dir = src_dir
+        self.exts = tuple(e if e.startswith(".") else "." + e
+                          for e in (exts or DEFAULT_EXTS))
+        self.rel_prefix = rel_prefix.replace("\\", "/").strip("/")
+        self.settings_paths = list(settings_paths
+                                  if settings_paths is not None
+                                  else self._default_settings())
+        self.max_files = max_files
+        self._settings_cache: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _default_settings():
+        """按优先级从低到高：User -> Workspace。工作区设置覆盖用户设置，
+        所以判定时后读的层级覆盖先读的。"""
+        appdata = os.environ.get("APPDATA", "")
+        return ([os.path.join(appdata, "Code", "User", "settings.json")]
+                if appdata else []) + [".vscode/settings.json"]
+
+    # ---------------------------------------------------------- 文件枚举
+    def iter_targets(self, source: Optional[str] = None,
+                     **kwargs) -> List[Target]:
+        root = self.src_dir
+        if os.path.isfile(root):
+            return [self._make_target(os.path.dirname(root) or ".",
+                                      os.path.basename(root))]
+        targets: List[Target] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames
+                                 if d not in SKIP_DIRS and not d.startswith("."))
+            for fn in sorted(filenames):
+                if fn.startswith("."):
+                    continue          # 隐藏文件（.env / .hidden.py）一律跳过
+                if fn.endswith(self.exts):
+                    targets.append(self._make_target(dirpath, fn))
+        if self.max_files and len(targets) > self.max_files:
+            targets = targets[:self.max_files]
+        return targets
+
+    def _make_target(self, dirpath, filename) -> Target:
+        abs_path = os.path.join(dirpath, filename)
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except (UnicodeDecodeError, OSError) as exc:
+            # 读不出来的文件不该让整轮失败：标记出来，preflight 会报
+            return Target(path=self._rel(abs_path), content="",
+                          abs_path=abs_path, meta={"error": repr(exc)})
+        # 与 main.read_source 一致：统一换行，否则缓冲区记 \r 而编辑器收到回车
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        return Target(path=self._rel(abs_path), content=content,
+                      abs_path=abs_path)
+
+    def _rel(self, abs_path) -> str:
+        """相对**起始文件夹**的路径（正斜杠）。
+
+        必须是相对 src_dir 而不是 cwd：Quick Open 匹配的是「工作区相对路径」，
+        若按 cwd 算，src_dir 在工作区之外时会得到一串 ../../../..，根本匹配不上。
+        """
+        base = self.src_dir
+        if os.path.isfile(base):
+            base = os.path.dirname(base) or "."
+        try:
+            rel = os.path.relpath(abs_path, base)
+        except ValueError:                        # 跨盘符
+            rel = os.path.basename(abs_path)
+        return rel.replace("\\", "/")
+
+    # ---------------------------------------------------------- preflight
+    def _read_settings(self) -> Dict[str, Any]:
+        """合并所有层级的 settings.json，后读到的覆盖先读到的。"""
+        if self._settings_cache is not None:
+            return self._settings_cache
+        merged: Dict[str, Any] = {}
+        for path in self.settings_paths:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                merged.setdefault("__errors__", []).append(f"{path}: {exc!r}")
+                continue
+            if isinstance(data, dict):
+                merged.update(data)
+        self._settings_cache = merged
+        return merged
+
+    def preflight(self, targets: List[Target]) -> List[str]:
+        from .keymap import unsupported_chars
+
+        errs: List[str] = []
+        if not os.path.isdir(self.src_dir) and not os.path.isfile(self.src_dir):
+            errs.append(f"起始文件夹不存在: {self.src_dir}")
+            return errs
+        if not targets:
+            errs.append(f"在 {self.src_dir} 下没找到任何匹配 "
+                        f"{'/'.join(self.exts)} 的文件")
+        for t in targets:
+            if t.meta.get("error"):
+                errs.append(f"{t.path}: 读取失败 {t.meta['error']}")
+            elif not t.content.strip():
+                errs.append(f"{t.path}: 文件为空，没有可输入的内容")
+            else:
+                bad = unsupported_chars(t.content)
+                if bad:
+                    shown = ", ".join(f"{i}:{ch!r}" for i, ch in bad[:3])
+                    errs.append(f"{t.path}: 含 {len(bad)} 个无法可靠键入的字符"
+                                f"（{shown}）")
+        settings = self._read_settings()
+        for e in settings.get("__errors__", []):
+            errs.append(f"settings.json 读取失败: {e}")
+        for key, (want, why) in VSCODE_REQUIRED_SETTINGS.items():
+            got = settings.get(key, "<未设置>")
+            if got != want:
+                errs.append(f"VSCode 设置 {key} 当前是 {got!r}，需要 {want!r}"
+                            f"——否则{why}")
+        return errs
+
+    def editor_warnings(self) -> List[str]:
+        return [
+            "VSCode 模式下内存缓冲区不等于文档，F10 中断可能留下半截文件；"
+            "正确性以存盘后回读磁盘为准。",
+            "建议在 git 仓库内运行，出问题可回滚。",
+        ]
+
+    def verify_trustworthy(self) -> bool:
+        return False
+
+
+register_mode(VSCodeMode)
