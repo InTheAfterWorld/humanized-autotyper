@@ -51,6 +51,12 @@ class Mode:
     def before_type(self, target: Target, typer) -> None:
         """把编辑器定位到 target（打开文件、光标归位等）。"""
 
+    def save_only(self, target: Target, typer) -> None:
+        """交替打字切走前的轻量存盘（不做完整校验）。
+
+        顺序路径不会调用它——after_type 已负责存盘 + 回读校验。默认无动作。
+        """
+
     def after_type(self, target: Target, typer) -> Dict[str, Any]:
         """打完之后的收尾与校验，返回可并入 summary 的字典。"""
         return {}
@@ -176,6 +182,9 @@ class VSCodeMode(Mode):
         self.open_settle_s = open_settle_s
         self.save_settle_s = save_settle_s
         self._settings_cache: Optional[Dict[str, Any]] = None
+        # 交替打字会重访同一文件：记录已打开过的路径，重访时不再清空文档，
+        # 只把光标压到文末接着打（否则会把已打的一半删掉）。
+        self._opened: set = set()
 
     @staticmethod
     def _default_settings():
@@ -347,7 +356,17 @@ class VSCodeMode(Mode):
         ex._tap_special("return")
         typer._sleep(self.open_settle_s, active=False)
 
-        # --- 清空文档 ---
+        if target.path in self._opened:
+            # 交替打字的重访：文档里已有一半内容，绝不能清空。把光标压到
+            # 文末，接着上次的位置继续打。缓冲区此时也恢复到该文件的槽位，
+            # 两边都在末尾，对齐。
+            ex.key_doc_end()
+            typer._sleep(self.open_settle_s / 2, active=False)
+            typer.logger.log("FILE", "resumed", target.path, 0)
+            return
+        self._opened.add(target.path)
+
+        # --- 清空文档（仅首次打开）---
         ex.key_select_all()
         typer._sleep(self.open_settle_s / 2, active=False)
         ex.delete_key()                  # 删掉选区；文件本就为空时是无害的空操作
@@ -356,6 +375,18 @@ class VSCodeMode(Mode):
         # 不做断言：此时读不到屏幕，无法证明 VSCode 真的清干净了；
         # 真正的确认在 after_type() 的存盘回读。
         typer.logger.log("FILE", "cleared", target.path, 0)
+
+    def save_only(self, target: Target, typer) -> None:
+        """交替打字切走前 Ctrl+S 存一次盘（不做回读校验）。
+
+        与 after_type 的区别：这里内容尚未打完，回读比对必然不一致，所以
+        只负责把已打的内容落盘，保证重访时磁盘与缓冲区一致。
+        """
+        if getattr(typer.cfg, "dry_run", True):
+            return
+        ex = typer.executor
+        ex.key_save()
+        typer._sleep(self.save_settle_s, active=False)
 
     def after_type(self, target: Target, typer) -> Dict[str, Any]:
         """Ctrl+S 存盘，等格式化落盘，然后回读磁盘做权威比对。

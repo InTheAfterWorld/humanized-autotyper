@@ -957,6 +957,156 @@ def test_modes_kill_stops_remaining_files():
     print(f"PASS modes_kill_stops_remaining_files handled={len(s['per_file'])}/10")
 
 
+def test_file_switch_interleaves_targets():
+    """交替打字：file_switch_chars>0 时必须轮转推进，而非一个打完再下一个。
+
+    每个文件 10 字符、配额 4，因此每个文件需要 3 轮（4+4+2）才打完；首轮
+    必须把三个文件各推进一段，且切走前要调用 save_only 存盘。
+    """
+    from .modes import Mode, Target
+
+    class InterleaveMode(Mode):
+        name = "interleave"
+        multi_target = True
+
+        def __init__(self):
+            self.visits = []      # 每次 before_type 的 (path, 已打文本)
+            self.saved = []       # 切走前存盘的 path
+            self.done = []        # 打完的 (path, 文本)
+
+        def iter_targets(self, source=None, **kw):
+            return [Target(path=f"f{i}.txt", content=f"0123456789")
+                    for i in range(3)]
+
+        def before_type(self, target, typer):
+            self.visits.append((target.path, typer.buffer.text))
+
+        def save_only(self, target, typer):
+            self.saved.append(target.path)
+
+        def after_type(self, target, typer):
+            self.done.append((target.path, typer.buffer.text))
+            return {"ok": typer.buffer.text == target.content,
+                    "detail": "" if typer.buffer.text == target.content
+                    else "mismatch"}
+
+        def verify_trustworthy(self):
+            return False
+
+    cfg = fast_cfg(file_switch_chars=4, switch_pause_s=(0, 0))
+    m = InterleaveMode()
+    t = AutoTyper(cfg, "", rng=random.Random(7), mode=m, targets=m.iter_targets())
+    t.sched.threshold = 1e18
+    s = t.run()
+
+    # 首轮必须三个文件各打一段（而不是一个打完）：三个不同的 path 都出现
+    first_round = [p for p, _ in m.visits[:3]]
+    assert sorted(first_round) == ["f0.txt", "f1.txt", "f2.txt"], \
+        f"首轮应轮转三个文件: {first_round}"
+    # 每个文件首轮只打了约配额个字符（< 全长 10），证明是分段推进
+    for _, text in m.visits[:3]:
+        assert len(text) < 10, f"首轮不该已打完整个文件: {text!r}"
+    # 每个文件都被访问了多次（分段），且最终都打完、内容一致
+    assert s["files"] == 3
+    assert s["files_ok"] == 3, f"逐文件校验应全过: {s['per_file']}"
+    expected = "0123456789"
+    for path, text in m.done:
+        assert text == expected, f"{path} 内容不对: {text!r}"
+    # 切走前对未打完的文件调用了 save_only（至少每个文件前两轮各一次）
+    assert len(m.saved) >= 3, f"切走前应存盘: {m.saved}"
+    print(f"PASS file_switch_interleaves_targets "
+          f"visits={len(m.visits)} saved={len(m.saved)}")
+
+
+def test_file_switch_disabled_is_sequential():
+    """file_switch_chars=0（默认）时必须保持顺序执行：一个文件彻底打完再切。"""
+    from .modes import Mode, Target
+
+    class SeqMode(Mode):
+        name = "seq"
+        multi_target = True
+
+        def __init__(self):
+            self.order = []
+
+        def iter_targets(self, source=None, **kw):
+            return [Target(path=f"f{i}.txt", content="abc\n")
+                    for i in range(3)]
+
+        def before_type(self, target, typer):
+            self.order.append(target.path)
+
+        def after_type(self, target, typer):
+            return {"ok": True, "detail": ""}
+
+        def verify_trustworthy(self):
+            return False
+
+    cfg = fast_cfg()   # 默认 file_switch_chars=0
+    m = SeqMode()
+    t = AutoTyper(cfg, "", rng=random.Random(8), mode=m, targets=m.iter_targets())
+    t.sched.threshold = 1e18
+    s = t.run()
+    # 顺序路径：before_type 每个文件只调用一次，顺序即目标顺序
+    assert m.order == ["f0.txt", "f1.txt", "f2.txt"], \
+        f"默认应顺序执行: {m.order}"
+    assert s["files_ok"] == 3
+    print("PASS file_switch_disabled_is_sequential")
+
+
+def test_vscode_before_type_resume_keeps_content():
+    """交替打字重访：第二次 before_type 绝不能清空文档，只把光标压到文末。
+
+    锁定按键序列：首次 = Ctrl+P → 路径 → Enter → Ctrl+A → Delete；
+    重访 = Ctrl+P → 路径 → Enter → Ctrl+End（无 Ctrl+A / Delete）。
+    """
+    from .modes import VSCodeMode, Target
+
+    events = []
+
+    class FakeExec:
+        def key_quick_open(self):     events.append(("combo", "ctrl+p"))
+        def key_select_all(self):     events.append(("combo", "ctrl+a"))
+        def key_save(self):           events.append(("combo", "ctrl+s"))
+        def key_doc_end(self):        events.append(("combo", "ctrl+end"))
+        def type_char(self, ch, d=0.0, hold=None):
+            events.append(("char", ch))
+        def _tap_special(self, name, hold=None):
+            events.append(("tap", name))
+        def delete_key(self):         events.append(("key", "delete"))
+
+    class FakeLogger:
+        def log(self, state, event, detail="", delay=0.0):
+            events.append(("log", f"{state}/{event}"))
+
+    class FakeTyper:
+        cfg = type("C", (), {"dry_run": False})()
+        executor = FakeExec()
+        logger = FakeLogger()
+
+        def _sleep(self, s, active=True, chunk=0.25):
+            events.append(("sleep", round(s, 3)))
+
+    m = VSCodeMode("proj", settings_paths=[], open_settle_s=0.1)
+    tgt = Target(path="a.py", content="hello")
+
+    # 首次：清空
+    m.before_type(tgt, FakeTyper())
+    seq1 = [e for e in events if e[0] in ("combo", "key", "tap")]
+    assert seq1[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
+        f"首次结尾必须 Ctrl+A + Delete: {seq1}"
+
+    # 重访：不清空，改为 Ctrl+End
+    events.clear()
+    m.before_type(tgt, FakeTyper())
+    seq2 = [e for e in events if e[0] in ("combo", "key", "tap")]
+    assert ("combo", "ctrl+a") not in seq2, f"重访不该清空: {seq2}"
+    assert ("key", "delete") not in seq2, f"重访不该删除: {seq2}"
+    assert ("combo", "ctrl+end") in seq2, f"重访应压到文末: {seq2}"
+    assert ("log", "FILE/resumed") in events, "重访应记录 resumed 便于审计"
+    print("PASS vscode_before_type_resume_keeps_content")
+
+
 def test_combo_keys_dry_run_and_ordering():
     """组合键：dry-run 只记日志不发键；live 下按下顺序正序、松开顺序逆序。"""
     import random as _r
@@ -1452,6 +1602,9 @@ def main():
     test_modes_single_file_is_1x_equivalent()
     test_modes_multi_target_resets_between_files()
     test_modes_kill_stops_remaining_files()
+    test_file_switch_interleaves_targets()
+    test_file_switch_disabled_is_sequential()
+    test_vscode_before_type_resume_keeps_content()
     test_combo_keys_dry_run_and_ordering()
     test_combo_keys_use_real_pynput_names()
     test_vscode_enumeration()

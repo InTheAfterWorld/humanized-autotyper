@@ -59,6 +59,9 @@ SLIDERS = {
         ("p_edit_previous", "跳回前文重写频率", 0, 2, 0.1, 0.4, "%", 1),
         ("edit_min_gap_s", "两次跳回最少间隔(秒)", 0, 600, 10, 90, "sec", 0),
         ("p_rewrite_chunk", "整段重打频率", 0, 2, 0.1, 0.6, "%", 1),
+        ("file_switch_on", None, None, None, None, None, None, None),
+        ("file_switch_chars", "交替打字(每文件字符数)", 10, 1000, 10, 200,
+         None, 0),
     ],
 }
 
@@ -91,6 +94,9 @@ class App(tk.Tk):
         self._run_started = None
         self._src_len = 0
         self.long_on_var = tk.BooleanVar(value=True)
+        # 文件间交替打字（多文件模式）：默认关闭；开启后按字符数轮转推进。
+        self.file_switch_on_var = tk.BooleanVar(value=False)
+        self.file_switch_chars_var = tk.IntVar(value=200)
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
@@ -172,6 +178,25 @@ class App(tk.Tk):
                     text="启用长暂停（中途离开电脑几分钟～半小时再回来继续打）"
                 ).grid(row=i, column=0, columnspan=2, sticky="w",
                        padx=14, pady=(14, 2))
+                continue
+            if field == "file_switch_on":
+                ttk.Checkbutton(
+                    frame, variable=self.file_switch_on_var,
+                    text="文件间交替打字（多文件时按字符数轮转推进，像同时在改几个文件）"
+                ).grid(row=i, column=0, columnspan=2, sticky="w",
+                       padx=14, pady=(14, 2))
+                continue
+            if field == "file_switch_chars":
+                # 用 Spinbox 而非滑块：字符数是离散整数，且范围较大（10~1000）
+                row = ttk.Frame(frame)
+                row.grid(row=i, column=0, columnspan=2, sticky="ew",
+                         padx=10, pady=4)
+                frame.columnconfigure(0, weight=1)
+                ttk.Label(row, text=label, width=24).pack(side="left")
+                tk.Spinbox(row, from_=lo, to=hi, increment=res,
+                           textvariable=self.file_switch_chars_var,
+                           width=8).pack(side="left", padx=8)
+                ttk.Label(row, text="字符后切下一个文件").pack(side="left")
                 continue
             var = tk.DoubleVar(value=dft)
             self.vars[field] = var
@@ -314,6 +339,9 @@ class App(tk.Tk):
         c.pause_short_clip = (0.8, float(self.vars["pause_clip_hi"].get()))
         if not self.long_on_var.get():
             c.long_pause_xmin = c.long_pause_cap = 1e9   # 永不触发
+        # 文件间交替打字：开关关闭时强制 0（= 顺序执行，1.x 默认行为）。
+        c.file_switch_chars = (int(self.file_switch_chars_var.get())
+                               if self.file_switch_on_var.get() else 0)
         c.countdown_seconds = self.cd_var.get()
         c.expected_window_title = self.window_var.get().strip()
         return c
@@ -348,6 +376,8 @@ class App(tk.Tk):
         data["_preset"] = self.preset_var.get()
         data["_countdown"] = self.cd_var.get()
         data["_long_on"] = self.long_on_var.get()
+        data["_file_switch_on"] = self.file_switch_on_var.get()
+        data["_file_switch_chars"] = self.file_switch_chars_var.get()
         data["_window"] = self.window_var.get()
         data["_mode"] = self.mode_var.get()
         data["_src_dir"] = self.src_dir_var.get()
@@ -374,6 +404,10 @@ class App(tk.Tk):
                 self.cd_var.set(int(v))
             elif k == "_long_on":
                 self.long_on_var.set(bool(v))
+            elif k == "_file_switch_on":
+                self.file_switch_on_var.set(bool(v))
+            elif k == "_file_switch_chars":
+                self.file_switch_chars_var.set(int(v))
             elif k == "_window":
                 self.window_var.set(str(v))
             elif k == "_mode":
@@ -767,6 +801,14 @@ def selftest():
     off = app._collect_config()
     assert off.long_pause_cap > 1e8
     app.long_on_var.set(True)
+    # 文件间交替打字：默认关闭 -> 0；开启后取 Spinbox 值
+    assert app.file_switch_on_var.get() is False
+    assert app._collect_config().file_switch_chars == 0, \
+        "默认必须关闭交替打字（= 顺序执行）"
+    app.file_switch_on_var.set(True)
+    app.file_switch_chars_var.set(150)
+    assert app._collect_config().file_switch_chars == 150
+    app.file_switch_on_var.set(False)
     # 预设映射
     app.preset_var.set("手生普通人")
     app._apply_preset()
@@ -775,11 +817,16 @@ def selftest():
     # 设置持久化往返
     app.preset_var.set("高效型程序员")
     app._apply_preset()
+    app.file_switch_on_var.set(True)
+    app.file_switch_chars_var.set(333)
     app._save_settings()
     app2 = App()
     assert abs(app2.vars["delay_mu"].get() -
                app.vars["delay_mu"].get()) < 1e-9
     assert app2.cd_var.get() == app.cd_var.get()
+    # 文件间交替打字设置必须随 settings 持久化往返
+    assert app2.file_switch_on_var.get() is True
+    assert app2.file_switch_chars_var.get() == 333
     # 载入设置后标签不能停留在默认值
     assert app2.labels["delay_mu"].cget("text") == app2.label_fmt["delay_mu"]\
         .format(app2.vars["delay_mu"].get())

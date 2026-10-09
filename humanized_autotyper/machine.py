@@ -85,6 +85,10 @@ class AutoTyper:
         # 长暂停剩余墙钟秒数（0 表示当前不在长暂停里）；界面用它显示倒计时。
         self.pause_long_left = 0.0
         self.cur_state = "TYPING"
+        # 交替打字配额：>0 表示本次 _drive 最多再打多少字符（打满就存盘切文件），
+        # 0 = 不限（顺序/单文档路径，行为与 1.x 逐字相同）。
+        self._slice_budget = 0
+        self._slice_typed = 0
         # 标注成 dict[str, Any]：字面量全是非负 int，类型检查器会推成
         # dict[str, int]，于是 run() 里 `summary["elapsed_s"] = round(...)`
         # （float）、`summary["final_matches_source"] = ...`（bool）全被拒。
@@ -111,11 +115,20 @@ class AutoTyper:
             return self._run_multi()
         return self._run_single()
 
+    def _slice_expired(self):
+        """交替打字配额是否已用尽（0 = 不限，永不触发）。
+
+        顺序/单文档路径下 _slice_budget 恒为 0，因此本方法恒返回 False，
+        行为与 1.x 逐字相同；只有 _run_interleaved 会在切文件前设好配额。
+        """
+        return self._slice_budget > 0 and self._slice_typed >= self._slice_budget
+
     def _drive(self):
         """跑完当前 target 的打字状态机（单文档与多模式共用）。"""
         state = "TYPING"
         try:
-            while not self.kill.killed() and not self.finished:
+            while (not self.kill.killed() and not self.finished
+                   and not self._slice_expired()):
                 if self.kill.paused():
                     self._wait_while_paused()
                     continue
@@ -168,48 +181,72 @@ class AutoTyper:
         self.executor.start()
         self.executor.check_window()
         self.started_at = time.time()
+        self._total_chars = 0
+
+        # file_switch_chars > 0 且真的有多文件时走交替推进；否则顺序执行
+        # （顺序是 1.x 以来的原始行为，也是默认路径）。
+        if self.cfg.file_switch_chars > 0 and len(targets) > 1:
+            per_file = self._run_interleaved(mode, targets)
+        else:
+            per_file = self._run_sequential(mode, targets)
+        try:
+            self.executor.stop()
+        except Exception:
+            pass
+        return self._summarise(mode, targets, per_file)
+
+    def _run_sequential(self, mode, targets):
+        """一个文件彻底打完再切下一个（顺序执行）。"""
         per_file = []
         total_chars = 0
+        for idx, target in enumerate(targets, 1):
+            if self.kill.killed():
+                break
+            self._reset_for_target()
+            self.source = target.content
+            self.pipeline = Pipeline(target.content)
+            self.logger.log("FILE", "start",
+                            f"{idx}/{len(targets)} {target.path}", 0)
+            self._notify_progress(idx - 1, len(targets), target)
+            try:
+                mode.before_type(target, self)
+            except Exception as exc:
+                self.logger.log("FILE", "acquire_failed",
+                                 f"{target.path}: {exc!r}", 0)
+                per_file.append({"path": target.path, "ok": False,
+                                 "detail": f"定位失败: {exc}"})
+                continue
+            self._drive()
+            result = self._finish_one(mode, target)
+            total_chars += self.stats["chars"]
+            per_file.append({"path": target.path,
+                             "ok": result.get("ok"),
+                             "detail": result.get("detail", ""),
+                             "chars": self.stats["chars"]})
+        self._total_chars = total_chars
+        return per_file
+
+    def _notify_progress(self, done, total, target):
+        """推一次逐文件进度给 GUI（失败不能影响打字流程）。"""
+        if self.cfg.progress_hook:
+            try:
+                self.cfg.progress_hook(done, total, target)
+            except Exception:
+                pass
+
+    def _finish_one(self, mode, target):
+        """收尾一个文件：调模式的 after_type，异常按失败记录。"""
         try:
-            for idx, target in enumerate(targets, 1):
-                if self.kill.killed():
-                    break
-                self._reset_for_target()
-                self.source = target.content
-                self.pipeline = Pipeline(target.content)
-                self.logger.log("FILE", "start",
-                                 f"{idx}/{len(targets)} {target.path}", 0)
-                if self.cfg.progress_hook:
-                    try:
-                        self.cfg.progress_hook(idx - 1, len(targets), target)
-                    except Exception:
-                        pass
-                try:
-                    mode.before_type(target, self)
-                except Exception as exc:
-                    self.logger.log("FILE", "acquire_failed",
-                                     f"{target.path}: {exc!r}", 0)
-                    per_file.append({"path": target.path, "ok": False,
-                                     "error": f"定位失败: {exc}"})
-                    continue
-                self._drive()
-                result = {}
-                try:
-                    result = mode.after_type(target, self) or {}
-                except Exception as exc:
-                    result = {"ok": False, "error": f"校验失败: {exc}"}
-                total_chars += self.stats["chars"]
-                # ok 可能是 None（模式声明本次未做校验，例如 dry-run 下的
-                # VSCode 回读是恒真式）——不能当成失败。
-                per_file.append({"path": target.path,
-                                 "ok": result.get("ok"),
-                                 "detail": result.get("detail", ""),
-                                 "chars": self.stats["chars"]})
-        finally:
-            self.executor.stop()
-        elapsed = time.time() - self.started_at
+            return mode.after_type(target, self) or {}
+        except Exception as exc:
+            return {"ok": False, "detail": f"校验失败: {exc}"}
+
+    def _summarise(self, mode, targets, per_file):
+        """顺序与交替两种调度共用的收尾：组装 summary 并写日志尾标。"""
+        # started_at 在 run() 进入调度前必然已赋值；这里兜底仅为满足类型检查。
+        elapsed = time.time() - (self.started_at or time.time())
         summary = dict(self.stats)
-        summary["chars"] = total_chars
+        summary["chars"] = self._total_chars
         summary["files"] = len(targets)
         summary["files_ok"] = sum(1 for f in per_file if f["ok"] is True)
         # 未校验（ok=None）与失败（ok=False）必须分开报，否则会误导排查方向
@@ -229,6 +266,116 @@ class AutoTyper:
         except Exception:
             pass
         return summary
+
+    def _drive_limited(self, budget):
+        """限量驱动状态机：本文件最多打 budget 个字符就停（切文件用）。"""
+        self._slice_budget = budget
+        self._slice_typed = 0
+        try:
+            self._drive()
+        finally:
+            self._slice_budget = 0
+            self._slice_typed = 0
+
+    def _save_only(self, mode, target):
+        """切文件前的轻量存盘（不做完整校验）；异常不影响主流程。
+
+        顺序路径不会调用它——那里 after_type 已经负责存盘 + 回读校验。
+        """
+        saver = getattr(mode, "save_only", None)
+        if saver is None:
+            return
+        try:
+            saver(target, self)
+        except Exception as exc:
+            self.logger.log("FILE", "save_failed",
+                            f"{target.path}: {exc!r}", 0)
+
+    def _run_interleaved(self, mode, targets):
+        """多文件交替：每个文件打满 file_switch_chars 就存盘切到下一个。
+
+        每个文件一个常驻槽（缓冲区 + 管道 + 已打字符进度），切回来时原样
+        恢复，因此每个文件都从上次停下的位置继续打，直到全部完成。切文件
+        之间插入 switch_pause_s 的随机停顿（人尺度），像真人同时在改几个
+        文件。一轮里所有文件都没有任何进展（理论上不该发生）则退出防死循环。
+        """
+        budget = max(1, int(self.cfg.file_switch_chars))
+        # 每文件常驻状态：buf 缓冲区、pipe 管道、done 是否打完。管道与缓冲区
+        # 都跨轮保留，切回来时原样恢复，因此无需假设"缓冲区长度 == 管道位置"。
+        slots = []
+        for t in targets:
+            slots.append({"target": t, "buf": Buffer(""),
+                          "pipe": Pipeline(t.content), "done": False,
+                          "result": None})
+        total = len(slots)
+        completed = 0
+        total_chars = 0
+        self._total_chars = 0
+        try:
+            while completed < total and not self.kill.killed():
+                progressed = False
+                for slot in slots:
+                    if self.kill.killed():
+                        break
+                    if slot["done"]:
+                        continue
+                    target = slot["target"]
+                    # 恢复该文件的缓冲区与管道（不重建，接着上次打）
+                    self.buffer = slot["buf"]
+                    self.pipeline = slot["pipe"]
+                    self.source = target.content
+                    self.finished = False
+                    self.err_typed = ""
+                    self.err_intended = ""
+                    self.err_detect_in = -1
+                    self.pause_long_left = 0.0
+                    self.sched.reset()
+                    self.logger.log("FILE", "start",
+                                    f"interleave {target.path}", 0)
+                    self._notify_progress(completed, total, target)
+                    try:
+                        mode.before_type(target, self)
+                    except Exception as exc:
+                        self.logger.log("FILE", "acquire_failed",
+                                        f"{target.path}: {exc!r}", 0)
+                        slot["result"] = {"ok": False,
+                                          "detail": f"定位失败: {exc}"}
+                        slot["done"] = True
+                        completed += 1
+                        continue
+                    before_chars = self.stats["chars"]
+                    self._drive_limited(budget)
+                    typed = self.stats["chars"] - before_chars
+                    total_chars += typed
+                    progressed = progressed or typed > 0
+                    # 打完的判定：finished（管道取空时置位）或管道已耗尽。
+                    # 后者兜底"文件长度恰为配额整数倍"的边界——最后一个字符
+                    # 打完即触顶，_h_typing 来不及取到 None 就退出了循环。
+                    if self.finished or self.pipeline.peek() is None:
+                        self.finished = True
+                        slot["result"] = self._finish_one(mode, target)
+                        slot["done"] = True
+                        completed += 1
+                    else:
+                        # 没打完：存盘 + 随机停顿，等下一轮回来接着打
+                        self._save_only(mode, target)
+                        if self.cfg.switch_pause_s:
+                            self._sleep(
+                                self.rng.uniform(*self.cfg.switch_pause_s),
+                                active=False)
+                if not progressed:
+                    break      # 一轮毫无进展：防死循环
+        finally:
+            self._total_chars = total_chars
+        # 汇总 per_file（含未完成的），保持与顺序路径一致的字段
+        per_file = []
+        for slot in slots:
+            res = slot["result"] or {}
+            per_file.append({"path": slot["target"].path,
+                             "ok": res.get("ok"),
+                             "detail": res.get("detail", ""),
+                             "chars": len(slot["buf"].text)})
+        return per_file
 
     def _reset_for_target(self):
         """切换到下一个文件前清干净跨文件状态。"""
@@ -324,6 +471,7 @@ class AutoTyper:
         self.buffer.type_char(ch)
         self.last_sent = ch
         self.stats["chars"] += 1
+        self._slice_typed += 1
         if urgent:
             return  # 已请求停止：不再制造拟人延时，尽快补完
         self._sleep(d, active=True)
@@ -400,7 +548,7 @@ class AutoTyper:
         self.err_detect_in = -1
 
     def _h_typing(self):
-        while not self.kill.killed():
+        while not self.kill.killed() and not self._slice_expired():
             ch = self.pipeline.next()
             if ch is None:
                 self._flush_correction()

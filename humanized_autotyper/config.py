@@ -109,3 +109,11 @@ class Config:
     long_sleep_chunk: float = 2.0
     resume_left_range: tuple = (0, 60)
     resume_reorient_range: tuple = (0.5, 2.0)
+
+    # --- 多目标模式（VSCode）的文件交替 ---
+    # 0 = 关闭：一个文件彻底打完再切下一个（旧行为，默认）。
+    # >0 = 每个文件连续打这么多字符后存盘切到下一个未完成的文件，
+    #      轮转一圈后回来接着打，像真人同时在改几个文件。
+    file_switch_chars: int = 0
+    # 切文件之间额外停多久（人尺度秒）。0 = 不额外停，沿用正常节奏。
+    switch_pause_s: tuple = (0.5, 2.0)

@@ -353,6 +353,16 @@ class Executor:
         if keys is not None:
             self.tap_combo(keys, label="ctrl+s")
 
+    def key_doc_end(self):
+        """Ctrl+End：把光标压到文档末尾。
+
+        交替打字重访某个文件时用——此时不能清空文档（已打了一半），只需把
+        光标移到文末接着打。与 key_select_all 同理，依赖组合键而非相对移动。
+        """
+        if self._Key is None:
+            return
+        self.tap_combo([self._Key.ctrl, self._Key.end], label="ctrl+end")
+
     def key_quick_open(self):
         """Ctrl+P（VSCode Quick Open）。"""
         keys = self._ctrl_key("p")
