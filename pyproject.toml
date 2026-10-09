@@ -13,10 +13,32 @@ dependencies = [
     # dry-run、自检、审计日志都不需要它。
     "pynput>=1.7",
 ]
+license = { text = "MIT" }
+authors = [{ name = "LXTimer" }]
+keywords = ["automation", "typing", "keystrokes", "humanize", "pynput", "vscode"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Utilities",
 ]
+# 项目主页：PyPI 上「Project links」区块会显示这一条
+[project.urls]
+Homepage = "https://github.com/InTheAfterWorld/humanized-autotyper"
+Source = "https://github.com/InTheAfterWorld/humanized-autotyper"
 
 [project.scripts]
 autotyper = "humanized_autotyper.main:main"

@@ -7,3 +7,7 @@ dist/
 autotyper_log.csv
 gui_settings.json
 *.tmp
+# 本地测试用的临时文件
+_*
+_vtest/
+_b.txt
