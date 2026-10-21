@@ -10,7 +10,7 @@ from .buffer import Buffer
 from .delays import DelayModel
 from .keymap import unsupported_chars, dyad_factor, FINGER
 from .typos import TypoEngine, is_typoable
-from .machine import AutoTyper
+from .machine import AutoTyper, LongPauseScheduler
 from .main import DEMO_SOURCE, source_problem
 
 
@@ -207,6 +207,94 @@ def test_pause_long_ritual_clamped():
         assert left <= upto, f"左移 {left} 次 > 已打 {upto} 字符"
         assert t.buffer.text == before and t.buffer.cursor == len(before)
     print("PASS pause_long_ritual_clamped")
+
+
+def test_long_horizon_unit():
+    """长程模式：工作时段阈值、休息时长、REST 处理和调度器重置。"""
+    cfg = fast_cfg(
+        long_horizon=True,
+        work_session_range=(5.0, 5.0),
+        break_range=(0.25, 0.25),
+        long_pause_xmin=0.01,
+        long_pause_cap=0.02,
+    )
+    dm = DelayModel(cfg, random.Random(11))
+    assert dm.work_session() == 5.0
+    assert dm.rest_duration() == 0.25
+    sched = LongPauseScheduler(dm)
+    assert sched.threshold == 5.0
+    sched.add(5.0)
+    assert sched.should_fire()
+    sched.reset()
+    assert sched.active == 0.0 and sched.threshold == 5.0
+
+    t = _primed_typer(cfg, 500)
+    before = t.buffer.text
+    cur = t.buffer.cursor
+    t.sched.active = 5.0
+    assert t._h_rest() == "TYPING"
+    assert t.stats["rests"] == 1 and t.stats["long_pauses"] == 0
+    assert t.buffer.text == before and t.buffer.cursor == cur
+    assert t.sched.active < 0.5 and t.sched.threshold == 5.0
+    # 多文件切换不能把工作时段计时清零
+    t.sched.active = 3.0
+    t._reset_for_target()
+    assert t.sched.active == 3.0, "长程模式的工作时段必须跨文件累计"
+    print("PASS long_horizon_unit")
+
+
+def test_long_horizon_dry_run():
+    """长程模式的端到端行为：会休息、不会走旧 Pareto 长暂停、文本不变。"""
+    cfg = fast_cfg(
+        long_horizon=True,
+        work_session_range=(5.0, 5.0),
+        break_range=(0.5, 0.5),
+        long_pause_xmin=0.01,
+        long_pause_cap=0.02,
+    )
+    t = AutoTyper(cfg, DEMO_SOURCE, rng=random.Random(23))
+    s = t.run()
+    assert s["final_matches_source"], "BUFFER != SOURCE after long-horizon run"
+    assert s["source_consumed"] == len(DEMO_SOURCE)
+    assert s["rests"] >= 1, "长程模式没有触发任何休息"
+    assert s["long_pauses"] == 0, "长程模式不应再走 Pareto 长暂停"
+    print(f"PASS long_horizon_dry_run rests={s['rests']} "
+          f"longP={s['long_pauses']}")
+
+
+def test_long_horizon_multi_file_stats():
+    """顺序多文件模式下，长程休息计数必须跨文件累计，而不是只报最后一个文件。"""
+    from .modes import Mode, Target
+
+    class StatsMode(Mode):
+        name = "lhstats"
+        multi_target = True
+
+        def before_type(self, target, typer):
+            pass
+
+        def after_type(self, target, typer):
+            return {"ok": True, "detail": ""}
+
+    cfg = fast_cfg(
+        long_horizon=True,
+        work_session_range=(0.0, 0.0),
+        break_range=(0.0, 0.0),
+        p_typo=0.0,
+        p_burst_enter=0.0,
+        p_backspace_burst=0.0,
+        p_pause_short=0.0,
+        p_edit_previous=0.0,
+        p_rewrite_chunk=0.0,
+        p_review=0.0,
+    )
+    t = AutoTyper(cfg, "", rng=random.Random(31), mode=StatsMode(),
+                  targets=[Target("a", "abc"), Target("b", "def")])
+    s = t.run()
+    # 每个文件的最后一个字符不休息，所以 3+3 字符共 2+2 次休息。
+    assert s["chars"] == 6, f"chars 应跨文件累计，实际 {s['chars']}"
+    assert s["rests"] == 4, f"rests 应跨文件累计，实际 {s['rests']}"
+    print("PASS long_horizon_multi_file_stats")
 
 
 def test_burst_no_fake_count():
@@ -1579,6 +1667,9 @@ def main():
     test_burst_unit()
     test_pause_long_unit()
     test_pause_long_ritual_clamped()
+    test_long_horizon_unit()
+    test_long_horizon_dry_run()
+    test_long_horizon_multi_file_stats()
     test_burst_no_fake_count()
     test_transposition_payload()
     test_kill_mid_edit_keeps_text()

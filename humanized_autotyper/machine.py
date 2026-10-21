@@ -31,10 +31,23 @@ class Pipeline:
 
 
 class LongPauseScheduler:
+    """按“活跃打字时间”累计，决定什么时候进入长暂停 / 长程休息。
+
+    普通模式：阈值来自 Pareto 长暂停分布（旧行为）。
+    长程模式：阈值来自 work_session_range；到点后 AutoTyper 进入 REST，
+    休息 break_range 秒，然后开始下一个工作时段。
+    """
+
     def __init__(self, delays: DelayModel):
         self.delays = delays
-        self.threshold = delays.sample_pareto_threshold()
+        self.threshold = self._next_threshold()
         self.active = 0.0
+
+    def _next_threshold(self):
+        cfg = getattr(self.delays, "cfg", None)
+        if cfg is not None and getattr(cfg, "long_horizon", False):
+            return self.delays.work_session()
+        return self.delays.sample_pareto_threshold()
 
     def add(self, seconds):
         self.active += seconds
@@ -43,13 +56,13 @@ class LongPauseScheduler:
         return self.active >= self.threshold
 
     def reset(self):
-        self.threshold = self.delays.sample_pareto_threshold()
+        self.threshold = self._next_threshold()
         self.active = 0.0
 
 
 class AutoTyper:
     STATES = ("TYPING", "BACKSPACE_BURST", "PAUSE_SHORT", "PAUSE_LONG",
-              "EDIT_PREVIOUS", "REWRITE_CHUNK", "REVIEW")
+              "REST", "EDIT_PREVIOUS", "REWRITE_CHUNK", "REVIEW")
 
     # rng 默认必须是 random.Random 实例（与 delays.py / typos.py 同理）：写
     # `rng=random` 会被推成 ModuleType，与全部 `rng=random.Random(n)` 调用冲突。
@@ -96,13 +109,16 @@ class AutoTyper:
         self.stats: Dict[str, Any] = {
             "chars": 0, "source_consumed": 0, "errors": 0,
             "corrections": 0, "bursts": 0, "short_pauses": 0,
-            "long_pauses": 0, "edits": 0, "rewrites": 0,
+            "long_pauses": 0, "rests": 0, "edits": 0, "rewrites": 0,
             "reviews": 0, "pause_count": 0}
+        # 多文件 summary 的跨文件累计计数器；单文件路径不使用。
+        self._stats_total: Dict[str, Any] = {}
         self.handlers = {
             "TYPING": self._h_typing,
             "BACKSPACE_BURST": self._h_burst,
             "PAUSE_SHORT": self._h_pause_short,
             "PAUSE_LONG": self._h_pause_long,
+            "REST": self._h_rest,
             "EDIT_PREVIOUS": self._h_edit_previous,
             "REWRITE_CHUNK": self._h_rewrite_chunk,
             "REVIEW": self._h_review,
@@ -166,8 +182,9 @@ class AutoTyper:
         """多目标模式：对每个 Target 重置 buffer/pipeline 后各跑一遍状态机。
 
         与单文档路径的关键差异：
-        - 每个文件开始前重置 buffer / pipeline / finished / 长暂停调度器，
-          否则第二个文件会带着第一个文件的疲劳与光标位置跑，必然出错；
+        - 每个文件开始前重置 buffer / pipeline / finished / 长暂停调度器
+          （长程模式例外：工作时段计时跨文件累计），否则第二个文件会带着
+          第一个文件的光标位置跑，必然出错；
         - 逐文件调用 mode.before_type() / mode.after_type()，由模式负责定位
           编辑器与校验；
         - summary 里的 final_matches_source 只有在 mode.verify_trustworthy()
@@ -182,6 +199,9 @@ class AutoTyper:
         self.executor.check_window()
         self.started_at = time.time()
         self._total_chars = 0
+        # 顺序路径每个文件都会重置 self.stats；summary 需要跨文件累计，
+        # 否则 rests/errors 等只反映最后一个文件（长程模式的休息也会丢）。
+        self._stats_total = {k: 0 for k in self.stats}
 
         # file_switch_chars > 0 且真的有多文件时走交替推进；否则顺序执行
         # （顺序是 1.x 以来的原始行为，也是默认路径）。
@@ -219,6 +239,8 @@ class AutoTyper:
             self._drive()
             result = self._finish_one(mode, target)
             total_chars += self.stats["chars"]
+            for k, v in self.stats.items():
+                self._stats_total[k] += v
             per_file.append({"path": target.path,
                              "ok": result.get("ok"),
                              "detail": result.get("detail", ""),
@@ -245,7 +267,7 @@ class AutoTyper:
         """顺序与交替两种调度共用的收尾：组装 summary 并写日志尾标。"""
         # started_at 在 run() 进入调度前必然已赋值；这里兜底仅为满足类型检查。
         elapsed = time.time() - (self.started_at or time.time())
-        summary = dict(self.stats)
+        summary = dict(self._stats_total)
         summary["chars"] = self._total_chars
         summary["files"] = len(targets)
         summary["files_ok"] = sum(1 for f in per_file if f["ok"] is True)
@@ -329,7 +351,8 @@ class AutoTyper:
                     self.err_intended = ""
                     self.err_detect_in = -1
                     self.pause_long_left = 0.0
-                    self.sched.reset()
+                    if not self.cfg.long_horizon:
+                        self.sched.reset()
                     self.logger.log("FILE", "start",
                                     f"interleave {target.path}", 0)
                     self._notify_progress(completed, total, target)
@@ -367,6 +390,8 @@ class AutoTyper:
                     break      # 一轮毫无进展：防死循环
         finally:
             self._total_chars = total_chars
+            # 交替路径不重置 self.stats，直接作为跨文件汇总的现场快照。
+            self._stats_total = dict(self.stats)
         # 汇总 per_file（含未完成的），保持与顺序路径一致的字段
         per_file = []
         for slot in slots:
@@ -387,8 +412,11 @@ class AutoTyper:
         self.err_detect_in = -1
         self.pause_long_left = 0.0
         # 疲劳/预热是"一个人连续打字"的属性；换文件等于换了一次会话，
-        # 但同一轮任务里的累积节奏保留——所以只重置长暂停调度器。
-        self.sched.reset()
+        # 但同一轮任务里的累积节奏保留——非长程模式只重置长暂停调度器。
+        # 长程模式下工作时段要跨文件累计，否则每次切文件都会把 1-2 小时
+        # 的工作计时清零，永远等不到休息。
+        if not self.cfg.long_horizon:
+            self.sched.reset()
         for k in self.stats:
             self.stats[k] = 0
 
@@ -567,10 +595,20 @@ class AutoTyper:
                 self.chars_since_progress = 0
                 self._progress()
             peek = self.pipeline.peek()
-            if self.sched.should_fire() and peek in (" ", "\n", None):
-                self.logger.log("SCHED", "long_pause_due",
-                                f"active={self.sched.active:.0f}s", 0)
-                return "PAUSE_LONG"
+            if self.sched.should_fire():
+                # 普通模式沿用旧行为：只在词边界/行尾/文末进入长暂停。
+                # 长程模式是“工作时段到了”，允许在任意字符边界休息（长行
+                # 文本也能休息），但不在文末休息——活已经干完了。
+                if self.cfg.long_horizon:
+                    fire = peek is not None
+                else:
+                    fire = peek in (" ", "\n", None)
+                if fire:
+                    event = ("rest_due" if self.cfg.long_horizon
+                             else "long_pause_due")
+                    self.logger.log("SCHED", event,
+                                    f"active={self.sched.active:.0f}s", 0)
+                    return "REST" if self.cfg.long_horizon else "PAUSE_LONG"
             boundary = peek in ("\n", None)
             if boundary and not self.executor.check_window():
                 # 焦点已经不在目标窗口：继续打下去就是往别的窗口里灌字
@@ -633,6 +671,28 @@ class AutoTyper:
         self._sleep(d, active=True)
         return "TYPING"
 
+    def _resume_ritual(self, state):
+        """长暂停/长程休息结束后“找回位置”的动作。
+
+        必须是“左 N 再右 N”的对称位移。若 N 超过已打字符数，真实编辑器会
+        先被文档头夹住、再往右冲过头，光标就与缓冲区错位了。
+        返回 False 表示中途收到停止请求，调用方不要再重置调度器。
+        """
+        left = min(self.rng.randint(*self.cfg.resume_left_range),
+                   self.buffer.cursor)
+        if left > 0:
+            self.executor.nav_left(left)
+            if self.kill.killed():
+                return False        # 已经要求停止，没必要再走回去
+            reorient_pause = self.rng.uniform(0.3, 1.2)
+            self._sleep(reorient_pause / self.cfg.speed_multiplier,
+                        active=False)
+            self.executor.nav_right(left)
+        self.logger.log(state, "resume_ritual", f"left={left}", 0)
+        reorient = self.rng.uniform(*self.cfg.resume_reorient_range)
+        self._sleep(reorient / self.cfg.speed_multiplier, active=True)
+        return True
+
     def _h_pause_long(self):
         d = self.delays.long_pause()
         self.stats["long_pauses"] += 1
@@ -647,23 +707,30 @@ class AutoTyper:
             return "TYPING"
         self.delays.reset_fatigue()
         self.delays.note_pause(d)
-        # 找回位置的动作必须是"左 N 再右 N"的对称位移。若 N 超过已打字符数，
-        # 真实编辑器会先被文档头夹住、再往右冲过头，光标就与缓冲区错位了。
-        left = min(self.rng.randint(*self.cfg.resume_left_range),
-                   self.buffer.cursor)
-        if left > 0:
-            self.executor.nav_left(left)
-            if self.kill.killed():
-                return "TYPING"     # 已经要求停止，没必要再走回去
-            reorient_pause = self.rng.uniform(0.3, 1.2)
-            self._sleep(reorient_pause / self.cfg.speed_multiplier,
-                        active=False)
-            self.executor.nav_right(left)
-        self.logger.log("PAUSE_LONG", "resume_ritual", f"left={left}", 0)
-        reorient = self.rng.uniform(*self.cfg.resume_reorient_range)
-        self._sleep(reorient / self.cfg.speed_multiplier, active=True)
+        if not self._resume_ritual("PAUSE_LONG"):
+            return "TYPING"
         # Clear the active-time window only when the pause fully completes,
         # so the next long-pause interval starts from zero.
+        self.sched.reset()
+        return "TYPING"
+
+    def _h_rest(self):
+        """长程模式的工作间休息：离开键盘 break_range 秒再回来。"""
+        d = self.delays.rest_duration()
+        self.stats["rests"] += 1
+        self.logger.log("REST", "sleep", f"{d:.0f}s", d * 1000)
+        # 与长暂停共用倒计时字段，GUI 状态栏能显示“长程休息中，剩 N 分钟”。
+        self.pause_long_left = d / self.cfg.speed_multiplier
+        self._sleep(d / self.cfg.speed_multiplier, active=False,
+                    chunk=self.cfg.long_sleep_chunk)
+        self.pause_long_left = 0.0
+        if self.kill.killed():
+            return "TYPING"
+        # 休息真的发生了：疲劳清零，下一个工作时段重新开始计时。
+        self.delays.reset_fatigue()
+        self.delays.note_pause(d)
+        if not self._resume_ritual("REST"):
+            return "TYPING"
         self.sched.reset()
         return "TYPING"
 

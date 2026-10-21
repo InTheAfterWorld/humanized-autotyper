@@ -46,7 +46,7 @@ autotyper-gui          # 或 py -m humanized_autotyper.gui
 |---|---|
 | 📝 内容 | 直接编辑要输入的文字（保存到 source.txt），或从文件导入 |
 | ⌨️ 节奏与错误 | 滑块调整：基础敲键间隔 / 节奏抖动 / 突发快打 / 错字率 / 连错窗口 / 疲劳 |
-| ⏸️ 停顿与删改 | 滑块调整：回删爆发 / 短停顿 / 长暂停(可开关) / 跳回重写 / 整段重打 / **文件间交替打字**(可开关) |
+| ⏸️ 停顿与删改 | 滑块调整：回删爆发 / 短停顿 / 长暂停(可开关) / **长程模式**(可开关) / 跳回重写 / 整段重打 / **文件间交替打字**(可开关) |
 | ▶️ 运行 | **模式**、预设人设、目标窗口标题、倒计时 |
 
 ### 模式（GUI）
@@ -167,6 +167,7 @@ autotyper-gui --selftest                   # 无界面 GUI 自检
 | `--log FILE` | CSV 事件日志路径（默认 `autotyper_log.csv`，**追加**写） |
 | `--fresh` | 启动时清空日志文件，而不是追加进去 |
 | `--verbose` | 逐事件打印到控制台 |
+| `--long-horizon` | 长程模式：工作 60–120 分钟后休息 5–30 分钟（替代 Pareto 长暂停） |
 | `--mode NAME` | 打字模式：`notepad`（默认，单文件）/ `vscode`（目录多文件）。`--mode list` 看全部 |
 | `--src-dir DIR` | vscode 模式：要处理的文件目录 |
 | `--ext LIST` | vscode 模式：逗号分隔的扩展名白名单 |
@@ -284,6 +285,35 @@ autotyper --mode vscode --src-dir ./src --ext .py --live --window "Visual Studio
 - 约每 50 行一次：用方向键回扫刚写的 5–25 个字符"看一眼"，再回到文末继续
   （只移动光标、不改文本，所以不影响最终一致性）
 
+### 长程模式（模拟长时间工作之间的休息）
+
+默认的长暂停是 Pareto 随机分布，更像"偶尔离开几分钟"；长程模式则把行为
+组织成**工作时段 → 休息 → 下一个工作时段**：
+
+```bash
+autotyper --long-horizon --file big_source.py --live --window Notepad
+```
+
+- 累计**活跃打字时间**达到 60–120 分钟后进入 `REST`，休息 5–30 分钟；
+- 休息结束后清零疲劳、做一次"左 N → 右 N"的找回位置仪式，并用 10 个字符
+  的预热曲线重新进入状态；
+- 长程模式允许在任意字符边界开始休息（长行/压缩代码也能停下来），但不会
+  在文末休息——活已经干完了；
+- 普通模式的 Pareto 长暂停在长程模式下不再触发，避免"频繁长暂停"和
+  "工作时段"两套节奏互相打架；
+- 多文件模式下工作时段会跨文件累计，不会因为切文件而清零；
+- GUI 在「⏸ 停顿与删改」页勾选「长程模式」即可，CLI 用 `--long-horizon`；
+- 时长在 `config.py` 里按秒配置：`work_session_range=(3600, 7200)`、
+  `break_range=(300, 1800)`，都是 human-scale 秒。默认是“工作 1–2 小时 →
+  休息 5–30 分钟”；如果想让休息本身达到 1–2 小时，把 `break_range` 改成
+  `(3600, 7200)` 即可，工作时段也按需调整；
+- **源文本要足够长**：阈值按 human-scale 活跃时间算，`--speed` 只压缩墙钟，
+  不会让 1–2 小时的工作时段变成几分钟。想快速验证可临时把两个范围调小，
+  或跑自检里的 `test_long_horizon_dry_run`。
+
+> 长程模式可以与单文件/VSCode 模式组合使用；它改变的是"什么时候休息"，
+> 不改变"往哪里打字"。
+
 ## 光标移动策略（纯方向键）
 
 所有导航/选区**只使用 ↑ ↓ ← → 四个方向键**（加 Shift 做选区），不使用
@@ -327,7 +357,9 @@ Home / End / Ctrl 组合，也不用鼠标和剪贴板：
 | `file_switch_chars` / `switch_pause_s` | 0 / (0.5, 2.0) | 文件间交替打字：每文件打多少字符后切下一个 / 切换间的随机停顿（`0` = 关闭，顺序执行） |
 | `dyad_same_finger` / `dyad_alt_hand` | 1.35 / 0.85 | 二元节奏：同指连击变慢、双手交替变快（`1.0` 可关闭） |
 | `typo_speed_exponent` | 1.2 | 错误率与局部速度耦合，打得越快越容易出错（`0` 可关闭） |
-| `long_pause_xmin` / `alpha` / `cap` | 240s / 1.4 / 2100s | 长停顿时长分布 |
+| `long_pause_xmin` / `alpha` / `cap` | 240s / 1.4 / 2100s | 普通模式的长停顿时长分布 |
+| `long_horizon` | False | 长程模式开关：用工作时段/休息替代 Pareto 长暂停 |
+| `work_session_range` / `break_range` | (3600,7200) / (300,1800) | 长程模式的工作/休息时长范围（秒，human-scale） |
 
 ## 工作流（蓝图的调参循环）
 
@@ -338,7 +370,8 @@ autotyper-report out.csv                               # obs vs cfg 对照
 ```
 
 CSV 格式：`ts,run_id,state,event,detail,delay_ms`（csv.writer 正确转义逗号）。
-`autotyper-report` 给出 typo/burst/pause 观测率 vs 配置率、逐字符延迟分布。
+`autotyper-report` 给出 typo/burst/pause 观测率 vs 配置率、逐字符延迟分布；
+长程模式的 `REST` 事件会单独显示为 `long-horizon rests`。
 
 ### 日志分段（重要）
 

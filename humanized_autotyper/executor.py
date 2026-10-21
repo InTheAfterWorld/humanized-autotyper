@@ -68,7 +68,8 @@ class Logger:
         "burst_len_range", "burst_speed_factor", "p_backspace_burst",
         "backspace_n_range", "p_pause_short", "p_pause_short_sentence",
         "pause_short_clip", "long_pause_xmin", "long_pause_alpha",
-        "long_pause_cap", "p_edit_previous", "edit_min_gap_s",
+        "long_pause_cap", "long_horizon", "work_session_range",
+        "break_range", "p_edit_previous", "edit_min_gap_s",
         "p_rewrite_chunk", "p_review", "delay_mu", "delay_ln_sigma",
         "delay_clip", "dyad_same_finger", "dyad_alt_hand", "fatigue_rate",
         "fatigue_cap", "warmup_factor", "warmup_chars", "speed_multiplier",
@@ -151,7 +152,7 @@ class Logger:
                 detail = json.dumps(
                     {k: summary.get(k) for k in
                      ("chars", "source_consumed", "errors", "edits",
-                      "rewrites", "final_matches_source", "killed",
+                      "rewrites", "rests", "final_matches_source", "killed",
                       "elapsed_s")},
                     sort_keys=True, default=str)
             except (TypeError, ValueError):

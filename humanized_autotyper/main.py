@@ -94,6 +94,10 @@ def parse_args(argv):
                         "(the log accumulates runs otherwise; report can split "
                         "them, but --fresh keeps the file single-run)")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--long-horizon", action="store_true",
+                   help="simulate long work sessions with real rests "
+                        "(work 60-120 min, rest 5-30 min; replaces the "
+                        "Pareto long-pause schedule)")
     p.add_argument("--mode", default="notepad", metavar="NAME",
                    help=f"typing mode, one of: {', '.join(mode_names())} "
                         "(default: notepad; --mode list for details)")
@@ -164,6 +168,7 @@ def main(argv=None):
         expected_window_title=args.window,
         log_file=args.log,
         fresh_log=args.fresh,
+        long_horizon=args.long_horizon,
         verbose=args.verbose,
     )
     if args.preset not in PRESETS:
@@ -211,6 +216,10 @@ def main(argv=None):
           f"speed={cfg.speed_multiplier}x "
           f"kill_hotkey={cfg.kill_hotkey.upper()}")
     print(f"source: {source_desc}")
+    if cfg.long_horizon:
+        ws, br = cfg.work_session_range, cfg.break_range
+        print(f"long-horizon: work {ws[0] / 60:.0f}-{ws[1] / 60:.0f} min, "
+              f"rest {br[0] / 60:.0f}-{br[1] / 60:.0f} min")
     # typer_mode 在两条分支里都已被赋成具体模式（notepad 在上面构造，
     # vscode 由 _build_mode 返回），这里统一提示各自的风险。
     if typer.mode is not None:

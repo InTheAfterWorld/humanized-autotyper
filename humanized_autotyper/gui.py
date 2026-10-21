@@ -29,6 +29,7 @@ from .presets import PRESETS, preset_names
 BASE_DIR = os.getcwd()
 SOURCE_TXT = os.path.join(BASE_DIR, "source.txt")
 SETTINGS_JSON = os.path.join(BASE_DIR, "gui_settings.json")
+LOG_FILE = os.path.join(BASE_DIR, "autotyper_log.csv")
 
 # 模式 -> 界面显示名。key 是 modes.py 里注册的模式名。
 MODE_LABELS = {"notepad": "单文件（任意编辑器）",
@@ -53,6 +54,7 @@ SLIDERS = {
         ("p_backspace_burst", "回删爆发频率", 0, 3, 0.1, 0.8, "%", 1),
         ("p_pause_short", "短停顿频率", 0, 5, 0.1, 0.8, "%", 1),
         ("pause_clip_hi", "短停顿上限(秒)", 1, 15, 0.5, 10.0, "raw", 1),
+        ("long_horizon_on", None, None, None, None, None, None, None),
         ("long_pause_on", None, None, None, None, None, None, None),
         ("long_pause_xmin", "长暂停最短(分钟)", 2, 30, 1, 4, "min", 0),
         ("long_pause_cap", "长暂停上限(分钟)", 10, 45, 1, 35, "min", 0),
@@ -93,6 +95,7 @@ class App(tk.Tk):
         self._tick_id = None    # 状态栏刷新定时器
         self._run_started = None
         self._src_len = 0
+        self.long_horizon_var = tk.BooleanVar(value=False)
         self.long_on_var = tk.BooleanVar(value=True)
         # 文件间交替打字（多文件模式）：默认关闭；开启后按字符数轮转推进。
         self.file_switch_on_var = tk.BooleanVar(value=False)
@@ -172,10 +175,17 @@ class App(tk.Tk):
     def _build_sliders(self, frame, defs):
         for i, (field, label, lo, hi, res, dft, unit, digits) \
                 in enumerate(defs):
+            if field == "long_horizon_on":
+                ttk.Checkbutton(
+                    frame, variable=self.long_horizon_var,
+                    text="长程模式（工作 1–2 小时后休息 5–30 分钟，替代长暂停）"
+                ).grid(row=i, column=0, columnspan=2, sticky="w",
+                       padx=14, pady=(14, 2))
+                continue
             if field == "long_pause_on":
                 ttk.Checkbutton(
                     frame, variable=self.long_on_var,
-                    text="启用长暂停（中途离开电脑几分钟～半小时再回来继续打）"
+                    text="启用长暂停（普通模式：中途离开电脑几分钟～半小时再回来继续打）"
                 ).grid(row=i, column=0, columnspan=2, sticky="w",
                        padx=14, pady=(14, 2))
                 continue
@@ -327,7 +337,7 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 配置
     def _collect_config(self):
-        c = Config(log_file=os.path.join(BASE_DIR, "autotyper_log.csv"),
+        c = Config(log_file=LOG_FILE,
                    dry_run=False)
         convs = {}
         for defs in SLIDERS.values():
@@ -337,6 +347,7 @@ class App(tk.Tk):
         for field, fn in convs.items():
             setattr(c, field, fn(self.vars[field].get()))
         c.pause_short_clip = (0.8, float(self.vars["pause_clip_hi"].get()))
+        c.long_horizon = self.long_horizon_var.get()
         if not self.long_on_var.get():
             c.long_pause_xmin = c.long_pause_cap = 1e9   # 永不触发
         # 文件间交替打字：开关关闭时强制 0（= 顺序执行，1.x 默认行为）。
@@ -375,6 +386,7 @@ class App(tk.Tk):
         data = {k: v.get() for k, v in self.vars.items()}
         data["_preset"] = self.preset_var.get()
         data["_countdown"] = self.cd_var.get()
+        data["_long_horizon_on"] = self.long_horizon_var.get()
         data["_long_on"] = self.long_on_var.get()
         data["_file_switch_on"] = self.file_switch_on_var.get()
         data["_file_switch_chars"] = self.file_switch_chars_var.get()
@@ -402,6 +414,8 @@ class App(tk.Tk):
                 self.preset_var.set(v)
             elif k == "_countdown":
                 self.cd_var.set(int(v))
+            elif k == "_long_horizon_on":
+                self.long_horizon_var.set(bool(v))
             elif k == "_long_on":
                 self.long_on_var.set(bool(v))
             elif k == "_file_switch_on":
@@ -571,6 +585,7 @@ class App(tk.Tk):
     # ------------------------------------------------- 状态栏 / 暂停 / ETA
     STATE_LABELS = {"TYPING": "正在输入", "BACKSPACE_BURST": "回删爆发",
                     "PAUSE_SHORT": "短停顿", "PAUSE_LONG": "长暂停",
+                    "REST": "长程休息",
                     "EDIT_PREVIOUS": "跳回前文改", "REWRITE_CHUNK": "整段重打",
                     "REVIEW": "回读刚写的"}
 
@@ -590,7 +605,9 @@ class App(tk.Tk):
             return "⏸ 已暂停（等待目标窗口 / 点「▶ 继续」）"
         left = getattr(t, "pause_long_left", 0.0)
         if left > 0:
-            return f"长暂停中，剩 {self._fmt_left(left)}"
+            what = ("长程休息" if getattr(t, "cur_state", "") == "REST"
+                    else "长暂停")
+            return f"{what}中，剩 {self._fmt_left(left)}"
         label = self.STATE_LABELS.get(getattr(t, "cur_state", "TYPING"),
                                       "正在输入")
         pct = 100.0 * t.pipeline.i / max(1, self._src_len)
@@ -696,6 +713,7 @@ class App(tk.Tk):
                 f"chars={s['chars']} errors={s['errors']} "
                 f"bursts={s['bursts']} edits={s['edits']} "
                 f"rewrites={s['rewrites']} reviews={s['reviews']} "
+                f"rests={s.get('rests', 0)} "
                 f"pauses={s['pause_count']}",
                 f"内容一致: {s['final_matches_source']}  "
                 f"耗时 {s['elapsed_s']}s"
@@ -771,13 +789,15 @@ def selftest():
     """无交互自检：构建全部控件、收集配置、校验滑块到配置的映射。
 
     注意：这里绝不真正启动输入（GUI 已无演练模式），也绝不动当前目录下用户
-    真正的 gui_settings.json —— 设置读写全部改走临时文件。
+    真正的 gui_settings.json / autotyper_log.csv —— 设置和日志都改走临时路径。
     """
-    global SETTINGS_JSON
+    global SETTINGS_JSON, LOG_FILE
     import random
     import tempfile
     SETTINGS_JSON = os.path.join(tempfile.gettempdir(),
                                 "autotyper_selftest_settings.json")
+    LOG_FILE = os.path.join(tempfile.gettempdir(),
+                            "autotyper_selftest_log.csv")
     app = App()
     app.update_idletasks()
     cfg = app._collect_config()
@@ -801,6 +821,12 @@ def selftest():
     off = app._collect_config()
     assert off.long_pause_cap > 1e8
     app.long_on_var.set(True)
+    # 长程模式：默认关闭；开启后必须传到 Config
+    assert app.long_horizon_var.get() is False
+    assert app._collect_config().long_horizon is False
+    app.long_horizon_var.set(True)
+    assert app._collect_config().long_horizon is True
+    app.long_horizon_var.set(False)
     # 文件间交替打字：默认关闭 -> 0；开启后取 Spinbox 值
     assert app.file_switch_on_var.get() is False
     assert app._collect_config().file_switch_chars == 0, \
@@ -819,6 +845,7 @@ def selftest():
     app._apply_preset()
     app.file_switch_on_var.set(True)
     app.file_switch_chars_var.set(333)
+    app.long_horizon_var.set(True)
     app._save_settings()
     app2 = App()
     assert abs(app2.vars["delay_mu"].get() -
@@ -827,12 +854,14 @@ def selftest():
     # 文件间交替打字设置必须随 settings 持久化往返
     assert app2.file_switch_on_var.get() is True
     assert app2.file_switch_chars_var.get() == 333
+    # 长程模式开关也必须持久化
+    assert app2.long_horizon_var.get() is True
     # 载入设置后标签不能停留在默认值
     assert app2.labels["delay_mu"].cget("text") == app2.label_fmt["delay_mu"]\
         .format(app2.vars["delay_mu"].get())
     # 结束回调：正常结束与工作线程抛异常都必须复位界面
     done = {"chars": 10, "errors": 0, "bursts": 0, "edits": 0, "rewrites": 0,
-            "reviews": 0, "pause_count": 0,
+            "reviews": 0, "rests": 0, "pause_count": 0,
             "final_matches_source": True, "elapsed_s": 1.0, "killed": False}
     app._set_running(True)
     app.q.put(("done", done))
@@ -979,6 +1008,10 @@ def selftest():
     app.destroy()
     app2.destroy()
     os.remove(SETTINGS_JSON)
+    try:
+        os.remove(LOG_FILE)
+    except OSError:
+        pass
     print("GUI SELFTEST PASSED")
 
 

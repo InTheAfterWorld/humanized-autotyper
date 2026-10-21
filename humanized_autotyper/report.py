@@ -114,6 +114,13 @@ def split_runs(rows):
     return [run for run in runs if run["rows"]]
 
 
+def _fmt_horizon_seconds(seconds):
+    """Sub-minute ranges are used by tests/tuning; don't round them to 0min."""
+    if abs(seconds) < 60:
+        return f"{seconds:g}s"
+    return f"{seconds / 60:.0f}min"
+
+
 def _audit(run, cfg, out=print):
     """Print obs-vs-cfg for one run.  `cfg` must already be resolved."""
     rows = run["rows"]
@@ -127,6 +134,7 @@ def _audit(run, cfg, out=print):
     bursts = events.get(("BACKSPACE_BURST", "enter"), 0)
     pauses = events.get(("PAUSE_SHORT", "sleep"), 0)
     long_pauses = events.get(("PAUSE_LONG", "sleep"), 0)
+    rests = events.get(("REST", "sleep"), 0)
     edits = events.get(("EDIT_PREVIOUS", "start"), 0)
     rewrites = events.get(("REWRITE_CHUNK", "start"), 0)
     reviews = events.get(("REVIEW", "start"), 0)
@@ -157,8 +165,16 @@ def _audit(run, cfg, out=print):
     line("backspace burst", bursts, cfg.p_backspace_burst, chars,
          f"n in {cfg.backspace_n_range}")
     line("short pause (mid-line)", pauses, cfg.p_pause_short, chars)
-    out(f"{'long pauses':26s} {long_pauses} (Pareto x_min="
-        f"{cfg.long_pause_xmin:.0f}s alpha={cfg.long_pause_alpha})")
+    if getattr(cfg, "long_horizon", False):
+        ws_lo, ws_hi = cfg.work_session_range
+        br_lo, br_hi = cfg.break_range
+        out(f"{'long-horizon rests':26s} {rests}  (work "
+            f"{_fmt_horizon_seconds(ws_lo)}-{_fmt_horizon_seconds(ws_hi)}, "
+            f"break {_fmt_horizon_seconds(br_lo)}-"
+            f"{_fmt_horizon_seconds(br_hi)})")
+    else:
+        out(f"{'long pauses':26s} {long_pauses} (Pareto x_min="
+            f"{cfg.long_pause_xmin:.0f}s alpha={cfg.long_pause_alpha})")
     out(f"{'edit previous':26s} {edits}  p={cfg.p_edit_previous} at line end")
     out(f"{'rewrite chunk':26s} {rewrites}  p={cfg.p_rewrite_chunk} at line end")
     out(f"{'review pass':26s} {reviews}  p={cfg.p_review} at line end")

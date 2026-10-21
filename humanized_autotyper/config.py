@@ -110,6 +110,16 @@ class Config:
     resume_left_range: tuple = (0, 60)
     resume_reorient_range: tuple = (0.5, 2.0)
 
+    # --- 长程模式：模拟人类长时间工作之间的休息 ---
+    # False = 原来的 Pareto 长暂停行为（每几分钟活跃时间可能停 4-35 分钟）。
+    # True  = 按“工作时段”安排真正的休息：累计活跃打字时间达到
+    #         work_session_range 后进入 REST，休息 break_range 秒，然后
+    #         清零疲劳、做恢复仪式并开始下一个工作时段。
+    # 两个范围都是 human-scale 秒（不受 speed_multiplier 改变形状）。
+    long_horizon: bool = False
+    work_session_range: tuple = (60.0 * 60.0, 120.0 * 60.0)
+    break_range: tuple = (5.0 * 60.0, 30.0 * 60.0)
+
     # --- 多目标模式（VSCode）的文件交替 ---
     # 0 = 关闭：一个文件彻底打完再切下一个（旧行为，默认）。
     # >0 = 每个文件连续打这么多字符后存盘切到下一个未完成的文件，

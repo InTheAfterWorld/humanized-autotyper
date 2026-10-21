@@ -9,4 +9,4 @@
 也可以 `python -m humanized_autotyper`（等同 `autotyper`）。
 """
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"

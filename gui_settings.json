@@ -17,6 +17,8 @@
  "_preset": "标准",
  "_countdown": 5,
  "_long_on": true,
+ "_file_switch_on": false,
+ "_file_switch_chars": 200,
  "_window": "",
  "_mode": "VSCode（目录多文件）",
  "_src_dir": "C:\\Users\\George Luo\\Documents\\VSCode\\Humanized Autotyper",

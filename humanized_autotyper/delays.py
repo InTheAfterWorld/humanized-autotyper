@@ -145,5 +145,19 @@ class DelayModel:
         d = c.long_pause_xmin * (u ** (-1.0 / c.long_pause_alpha))
         return min(d, c.long_pause_cap)
 
+    def work_session(self):
+        """长程模式：下一次休息前要连续工作多少 human-scale 秒。"""
+        lo, hi = self.cfg.work_session_range
+        if hi < lo:
+            lo, hi = hi, lo
+        return self.rng.uniform(lo, hi)
+
+    def rest_duration(self):
+        """长程模式：这次休息持续多少 human-scale 秒。"""
+        lo, hi = self.cfg.break_range
+        if hi < lo:
+            lo, hi = hi, lo
+        return self.rng.uniform(lo, hi)
+
     def sample_pareto_threshold(self):
         return self.long_pause()
