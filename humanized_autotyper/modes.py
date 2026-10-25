@@ -179,7 +179,7 @@ SKIP_DIRS = frozenset({
 
 
 def _ensure_file_exists(path: str) -> None:
-    """确保目标文件在磁盘上存在，供 VSCode Quick Open 定位。
+    """确保目标文件在磁盘上存在，供 VS Code Quick Open 定位。
 
     VSCode 的 Quick Open 只能打开**已经存在于工作区**的文件：文件若从未
     创建/保存过，Quick Open 找不到它，Enter 也不会打开任何东西，后续的
@@ -192,7 +192,9 @@ def _ensure_file_exists(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8"):
+    # 使用 "a" 模式避免竞态窗口：若文件在 exists 检查后被其他进程创建，
+    # "w" 会将其内容截断为空，而 "a" 不会破坏已有数据。
+    with open(path, "a", encoding="utf-8"):
         pass
 
 
@@ -492,6 +494,13 @@ class VSCodeMode(Mode):
         if abs_path is not None:
             _ensure_file_exists(abs_path)
 
+        # 先发 Escape 确保 VS Code 处于干净状态（无残留 Quick Open、命令面板、
+        # 建议框或通知弹窗），避免定位器在污染状态下操作。
+        ex.key_escape()
+        typer._sleep(0.1, active=False)
+
+        # 无论首次还是重访，都重新定位到目标文件，确保 VS Code 当前活动编辑器
+        # 确实是我们要操作的那个，防止焦点漂移导致后续按键作用于错误文档。
         if self.resolved_locator() == "cli" and target.abs_path:
             self._open_with_cli(target, typer)
         elif self.locator == "cli":
@@ -500,17 +509,32 @@ class VSCodeMode(Mode):
             self._open_with_keyboard(target, typer)
 
         if target.path in self._opened:
+            # 文件此前已打开过：内容可能已打了一半，绝对不能清空。
+            # 只需把光标压到文末即可接着上次的进度继续输入。
             ex.key_doc_end()
             typer._sleep(self.open_settle_s / 2, active=False)
             typer.logger.log("FILE", "resumed", target.path, 0)
             return
         self._opened.add(target.path)
 
-        ex.key_select_all()
-        typer._sleep(self.open_settle_s / 2, active=False)
-        ex.delete_key()
-        typer._sleep(self.open_settle_s / 2, active=False)
-        typer.logger.log("FILE", "cleared", target.path, 0)
+        # 首次打开：如果文件是由 _ensure_file_exists 刚创建的空文件，
+        # 则无需执行危险的 Ctrl+A/Delete，直接开始打字即可。
+        # 这降低了"打开错误文件"极端场景下的数据丢失风险。
+        is_empty = False
+        if abs_path and os.path.exists(abs_path):
+            try:
+                is_empty = os.path.getsize(abs_path) == 0
+            except OSError:
+                pass
+
+        if is_empty:
+            typer.logger.log("FILE", "empty_skip_clear", target.path, 0)
+        else:
+            ex.key_select_all()
+            typer._sleep(self.open_settle_s / 2, active=False)
+            ex.delete_key()
+            typer._sleep(self.open_settle_s / 2, active=False)
+            typer.logger.log("FILE", "cleared", target.path, 0)
 
     def _open_with_cli(self, target: Target, typer) -> None:
         command = self._code_command()
@@ -530,25 +554,47 @@ class VSCodeMode(Mode):
             raise RuntimeError(
                 f"VS Code CLI 返回码 {result.returncode}"
                 + (f": {detail}" if detail else ""))
-        typer._sleep(self.open_settle_s, active=False)
+        # 即使返回码为0，stderr 中的错误/警告信息也应被重视（某些场景下 CLI
+        # 会输出警告但退出码仍为0，如 VS Code 正在更新或窗口未就绪）。
+        stderr_text = (result.stderr or "").strip()
+        if stderr_text and any(k in stderr_text.lower()
+                               for k in ("error", "unable", "failed",
+                                         "not found", "warning")):
+            raise RuntimeError(
+                f"VS Code CLI 报告潜在问题，stderr: {stderr_text}")
+        # 给 VS Code 至少 1.0 秒切换标签页（过小值在冷启动、大文件或重载时不可靠）。
+        settle = max(self.open_settle_s, 1.0)
+        typer._sleep(settle, active=False)
+        # 清除可能弹出的通知/欢迎页/对话框，确保后续操作不受阻碍。
+        ex = typer.executor
+        ex.key_escape()
+        typer._sleep(0.2, active=False)
         typer.logger.log("FILE", "located_cli", target.path, 0)
 
     def _open_with_keyboard(self, target: Target, typer) -> None:
         ex = typer.executor
+        # 双重 Escape：彻底清除任何残留的 Quick Open、建议框、命令面板或
+        # 多层嵌套模态 UI。单层 Escape 对嵌套场景（如命令面板内打开 Quick Open）
+        # 可能不足，导致残留文本与新路径拼接而打开错误文件。
+        ex.key_escape()
+        typer._sleep(0.1, active=False)
+        ex.key_escape()
+        typer._sleep(self.open_settle_s / 2, active=False)
         if self.rel_prefix:
             # src_dir 不是工作区根目录时，Quick Open 需要带前缀
             quick_path = f"{self.rel_prefix}/{target.path}"
-        elif target.abs_path is not None:
-            # 新建文件可能尚未进入 Quick Open 的索引；绝对路径可直接定位它。
-            quick_path = os.path.abspath(target.abs_path)
         else:
+            # 始终使用工作区相对路径。绝对路径在 Windows 上含反斜杠与盘符，
+            # 与 Quick Open 的相对路径匹配逻辑不兼容，导致定位失败或匹配错误。
             quick_path = target.path
         ex.key_quick_open()
         typer._sleep(self.open_settle_s, active=False)
         for ch in quick_path:
             ex.type_char(ch)
-            typer._sleep(self.open_settle_s / max(1, len(quick_path)),
-                         active=False)
+            # 每个字符至少给 30ms：防止长路径时单字符延迟趋近于零，
+            # Quick Open 过滤器跟不上输入速度而打开半匹配或错误文件。
+            per_char = max(self.open_settle_s / max(1, len(quick_path)), 0.03)
+            typer._sleep(per_char, active=False)
         # 关键：等 Quick Open 过滤收敛，否则 Enter 可能打开半匹配的文件
         typer._sleep(self.open_settle_s, active=False)
         ex._tap_special("enter")
