@@ -371,11 +371,13 @@ class AutoTyper:
                     typed = self.stats["chars"] - before_chars
                     total_chars += typed
                     progressed = progressed or typed > 0
-                    # 打完的判定：finished（管道取空时置位）或管道已耗尽。
-                    # 后者兜底"文件长度恰为配额整数倍"的边界——最后一个字符
-                    # 打完即触顶，_h_typing 来不及取到 None 就退出了循环。
-                    if self.finished or self.pipeline.peek() is None:
+                    # 打完的判定：必须以 self.finished 为准。_drive_limited
+                    # 因预算耗尽退出时，若管道已空但 _h_typing 来不及置位
+                    # finished（例如预算在状态转换中途触顶），在这里兜底
+                    # 强制置位，避免在退格/纠正尚未完成时即判定完成。
+                    if not self.finished and self.pipeline.peek() is None:
                         self.finished = True
+                    if self.finished:
                         slot["result"] = self._finish_one(mode, target)
                         slot["done"] = True
                         completed += 1

@@ -98,6 +98,21 @@ def _conv(unit):
             "sec": lambda v: v}[unit]
 
 
+def _find_workspace_root(path):
+    """从 path 开始向上查找包含 .vscode 的目录作为工作区根目录。
+
+    若找不到则返回 path 本身。这解决了用户在一个更大的 VS Code 工作区
+    中运行（target_dir 只是子项目）时，preflight 的"文件必须在工作区内"
+    检查基于错误根目录而拦截合法文件的问题。
+    """
+    p = os.path.abspath(path)
+    while p and p != os.path.dirname(p):
+        if os.path.isdir(os.path.join(p, ".vscode")):
+            return p
+        p = os.path.dirname(p)
+    return path
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -648,8 +663,9 @@ class App(tk.Tk):
             "VS Code CLI": "cli",
             "Ctrl+P 快捷键（实验）": "keyboard",
         }.get(self.locator_var.get(), "auto")
+        workspace_root = _find_workspace_root(target_dir)
         mode = VSCodeMode(src_dir, source_dir=src_dir, target_dir=target_dir,
-                          workspace_root=target_dir, locator=locator,
+                          workspace_root=workspace_root, locator=locator,
                           require_cli=not cfg.dry_run,
                           max_files=self.max_files_var.get())
         # 枚举 + 读取全部目标文件是同步的；大目录要几秒。先把状态画出来，

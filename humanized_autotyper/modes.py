@@ -140,6 +140,9 @@ VSCODE_REQUIRED_SETTINGS = {
     "editor.formatOnType": (False, "输入过程中自动格式化"),
     "editor.detectIndentation": (False,
                                  "会按文件已有内容猜 tab/space，不同文件会不一致"),
+    "files.autoSave": ("off",
+                        "自动保存会在打字中途写盘，回读可能读到不完整中间态，"
+                        "且与 Ctrl+S 产生写盘竞态"),
 }
 
 
@@ -283,10 +286,28 @@ class VSCodeMode(Mode):
     @staticmethod
     def _default_settings():
         """按优先级从低到高：User -> Workspace。工作区设置覆盖用户设置，
-        所以判定时后读的层级覆盖先读的。"""
+        所以判定时后读的层级覆盖先读的。
+
+        支持 Windows / macOS / Linux 三平台的默认用户设置路径。
+        不存在的路径由 _read_settings 的 FileNotFoundError 处理忽略。
+        """
+        paths = []
+        home = os.path.expanduser("~")
+        # Windows
         appdata = os.environ.get("APPDATA", "")
-        return ([os.path.join(appdata, "Code", "User", "settings.json")]
-                if appdata else []) + [".vscode/settings.json"]
+        if appdata:
+            paths.append(os.path.join(appdata, "Code", "User",
+                                      "settings.json"))
+        # macOS
+        paths.append(os.path.join(
+            home, "Library", "Application Support", "Code", "User",
+            "settings.json"))
+        # Linux
+        paths.append(os.path.join(home, ".config", "Code", "User",
+                                  "settings.json"))
+        # 当前工作区（由调用方或 settings_for 解析为绝对路径）
+        paths.append(".vscode/settings.json")
+        return paths
 
     # ---------------------------------------------------------- 文件枚举
     def iter_targets(self, source: Optional[str] = None,
@@ -308,7 +329,9 @@ class VSCodeMode(Mode):
                 return []
             return [target]
         targets: List[Target] = []
-        for dirpath, dirnames, filenames in os.walk(root):
+        # 显式 followlinks=False：不跟随符号链接进入目录，防止循环链接
+        # 导致无限递归或重复枚举。
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames[:] = sorted(
                 d for d in dirnames
                 if d not in SKIP_DIRS and not d.startswith(".")
@@ -422,15 +445,36 @@ class VSCodeMode(Mode):
                 if not target.abs_path:
                     continue
                 try:
-                    inside = (os.path.normcase(os.path.commonpath(
-                        [os.path.abspath(target.abs_path),
-                         self.workspace_root])) ==
-                              os.path.normcase(self.workspace_root))
-                except ValueError:
+                    # 用 startswith 替代 commonpath：避免跨盘符/UNC 路径抛
+                    # ValueError，且对符号链接场景更宽容。
+                    abs_path = os.path.abspath(target.abs_path)
+                    ws_root = os.path.normcase(os.path.normpath(
+                        self.workspace_root))
+                    norm_path = os.path.normcase(os.path.normpath(abs_path))
+                    inside = (norm_path == ws_root or
+                              norm_path.startswith(ws_root + os.sep))
+                except (ValueError, OSError):
                     inside = False
                 if not inside:
                     errs.append(f"{target.path}: 不在 VS Code 工作区根目录 "
                                 f"{self.workspace_root} 内")
+        # P0-13: 验证 VS Code CLI 可用性（间接确认安装与运行状态）
+        if self.resolved_locator() == "cli":
+            cmd = self._code_command()
+            if cmd:
+                try:
+                    result = subprocess.run(
+                        [cmd, "--version"], check=False, capture_output=True,
+                        text=True, timeout=10)
+                    if result.returncode != 0:
+                        errs.append(
+                            "VS Code CLI 无法响应（code --version 失败），"
+                            "请确认 VS Code 已正确安装")
+                except (OSError, subprocess.TimeoutExpired):
+                    errs.append(
+                        "VS Code CLI 无法响应，请确认 VS Code 已正确安装")
+            else:
+                errs.append("找不到 VS Code CLI 命令 code")
         if self.require_cli and self.resolved_locator() != "cli":
             errs.append("找不到 VS Code CLI 命令 code。请把 VS Code 的 bin "
                         "目录加入 PATH，或选择 keyboard 定位方式。")
@@ -464,11 +508,16 @@ class VSCodeMode(Mode):
         return errs
 
     def editor_warnings(self) -> List[str]:
-        return [
+        warnings = [
             "VSCode 模式下内存缓冲区不等于文档，F10 中断可能留下半截文件；"
             "正确性以存盘后回读磁盘为准。",
             "建议在 git 仓库内运行，出问题可回滚。",
         ]
+        if self.resolved_locator() == "keyboard":
+            warnings.append(
+                "使用快捷键定位时，请确保 VS Code 窗口已打开且处于前台，"
+                "否则快捷键会被其他应用截获。")
+        return warnings
 
     def verify_trustworthy(self) -> bool:
         return False
@@ -610,8 +659,15 @@ class VSCodeMode(Mode):
         if getattr(typer.cfg, "dry_run", True):
             return
         ex = typer.executor
+        # P0-12: 先 Escape 关闭可能存在的弹窗/通知/建议框，防止 Ctrl+S
+        # 被对话框截获而导致保存失败。
+        ex.key_escape()
+        typer._sleep(0.1, active=False)
         ex.key_save()
         typer._sleep(self.save_settle_s, active=False)
+        # 保存后关闭可能弹出的通知或确认框
+        ex.key_escape()
+        typer._sleep(0.1, active=False)
 
     def after_type(self, target: Target, typer) -> Dict[str, Any]:
         """Ctrl+S 存盘，等格式化落盘，然后回读磁盘做权威比对。
@@ -624,8 +680,14 @@ class VSCodeMode(Mode):
         if getattr(typer.cfg, "dry_run", True):
             return {"ok": None, "verified": False,
                     "detail": "dry-run 未发键，未做磁盘校验"}
+        # P0-12: 先 Escape 关闭可能阻塞的弹窗，确保 Ctrl+S 能直达编辑器
+        ex.key_escape()
+        typer._sleep(0.1, active=False)
         ex.key_save()
         typer._sleep(self.save_settle_s, active=False)
+        # 保存后关闭可能弹出的通知
+        ex.key_escape()
+        typer._sleep(0.1, active=False)
         actual = self._read_back(target)
         if actual is None:
             return {"ok": False, "verified": True,
