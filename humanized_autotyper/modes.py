@@ -550,11 +550,20 @@ class VSCodeMode(Mode):
 
         # 无论首次还是重访，都重新定位到目标文件，确保 VS Code 当前活动编辑器
         # 确实是我们要操作的那个，防止焦点漂移导致后续按键作用于错误文档。
+        located = False
         if self.resolved_locator() == "cli" and target.abs_path:
-            self._open_with_cli(target, typer)
+            try:
+                self._open_with_cli(target, typer)
+                located = True
+            except RuntimeError:
+                # CLI 定位失败（如 stderr 含警告、端口未就绪）时不直接放弃文件，
+                # 而是 fallback 到 keyboard 快捷键定位，确保文本仍能写入目标文件。
+                typer.logger.log("FILE", "cli_fallback",
+                                 f"{target.path}: CLI 定位失败，"
+                                 f"fallback 到快捷键定位", 0)
         elif self.locator == "cli":
             raise RuntimeError(f"CLI 定位需要目标文件绝对路径: {target.path}")
-        else:
+        if not located:
             self._open_with_keyboard(target, typer)
 
         if target.path in self._opened:
@@ -603,14 +612,6 @@ class VSCodeMode(Mode):
             raise RuntimeError(
                 f"VS Code CLI 返回码 {result.returncode}"
                 + (f": {detail}" if detail else ""))
-        # 即使返回码为0，stderr 中的错误/警告信息也应被重视（某些场景下 CLI
-        # 会输出警告但退出码仍为0，如 VS Code 正在更新或窗口未就绪）。
-        stderr_text = (result.stderr or "").strip()
-        if stderr_text and any(k in stderr_text.lower()
-                               for k in ("error", "unable", "failed",
-                                         "not found", "warning")):
-            raise RuntimeError(
-                f"VS Code CLI 报告潜在问题，stderr: {stderr_text}")
         # 给 VS Code 至少 1.0 秒切换标签页（过小值在冷启动、大文件或重载时不可靠）。
         settle = max(self.open_settle_s, 1.0)
         typer._sleep(settle, active=False)
