@@ -24,9 +24,33 @@ from .modes import (DEFAULT_EXTS, VSCODE_REQUIRED_SETTINGS, SingleFileMode,
                     VSCodeMode, collect_targets)
 from .presets import PRESETS, preset_names
 
-# 用户数据（内容 / 设置 / 日志）放当前工作目录：安装后代码位于只读的
+# 用户数据（内容 / 设置 / 日志）默认放当前工作目录：安装后代码位于只读的
 # site-packages，不能往里写。从项目根目录启动时路径与重构前一致。
-BASE_DIR = os.getcwd()
+def _default_base_dir():
+    """当前目录可写就用它；不可写时退回 %LOCALAPPDATA%。
+
+    从开始菜单/快捷方式启动时 cwd 可能是 System32 或 Program Files，
+    连日志文件都创建不了——点「开始」只会在 Tk 回调里静默抛异常，
+    看起来就像卡住了。这里先探测一次，避免那种"点了没反应"。
+    """
+    cwd = os.getcwd()
+    probe = os.path.join(cwd, f".autotyper_write_probe_{os.getpid()}")
+    try:
+        with open(probe, "w", encoding="ascii") as f:
+            f.write("ok")
+        os.remove(probe)
+        return cwd
+    except OSError:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        fallback = os.path.join(base, "humanized_autotyper")
+        try:
+            os.makedirs(fallback, exist_ok=True)
+            return fallback
+        except OSError:
+            return cwd
+
+
+BASE_DIR = _default_base_dir()
 SOURCE_TXT = os.path.join(BASE_DIR, "source.txt")
 SETTINGS_JSON = os.path.join(BASE_DIR, "gui_settings.json")
 LOG_FILE = os.path.join(BASE_DIR, "autotyper_log.csv")
@@ -156,19 +180,35 @@ class App(tk.Tk):
         lines = text.count("\n") + 1 if text else 0
         self.char_label.config(text=f"{len(text)} 字符 / {lines} 行")
 
+    def _show_path_error(self, title, path, exc):
+        self._log_line(f"=== {title} ===")
+        self._log_line(f"  {path}: {type(exc).__name__}: {exc}")
+        messagebox.showerror(
+            title, f"无法访问：\n{path}\n\n{type(exc).__name__}: {exc}")
+
     def _import_file(self):
         path = filedialog.askopenfilename(
             filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
         if not path:
             return
-        with open(path, "r", encoding="utf-8") as f:
-            self.txt.delete("1.0", "end")
-            self.txt.insert("1.0", f.read().replace("\r\n", "\n"))
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            # 先读完再替换：读到一半失败时不能把编辑框里已有内容清掉
+            self._show_path_error("导入失败", path, exc)
+            return
+        self.txt.delete("1.0", "end")
+        self.txt.insert("1.0", text.replace("\r\n", "\n"))
         self._update_char_count()
 
     def _save_source(self):
-        with open(SOURCE_TXT, "w", encoding="utf-8", newline="\n") as f:
-            f.write(self.txt.get("1.0", "end"))
+        try:
+            with open(SOURCE_TXT, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.txt.get("1.0", "end"))
+        except OSError as exc:
+            self._show_path_error("保存失败", SOURCE_TXT, exc)
+            return
         self.status.set(f"已保存到 {SOURCE_TXT}")
 
     # ---------------------------------------------------------- 参数页
@@ -476,6 +516,34 @@ class App(tk.Tk):
         self.log.configure(state="disabled")
 
     def _start(self):
+        """按钮入口：把启动阶段的异常变成可见的错误提示。
+
+        以前异常只打在 Tk 回调的 stderr 里（pythonw 下甚至看不到），
+        用户只会看到"点了没反应"。日志页会保留完整 traceback。
+        """
+        try:
+            self._start_impl()
+        except Exception as exc:
+            tb = traceback.format_exc()
+            self._log_line("=== 启动失败 ===")
+            for ln in tb.strip().splitlines()[-8:]:
+                self._log_line("  " + ln)
+            if self.running:
+                if self.typer is not None:
+                    self.typer.kill.set()
+                    try:
+                        self.typer.executor.stop()
+                    except Exception:
+                        pass
+                self._set_running(False)
+            messagebox.showerror(
+                "启动失败",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "完整 traceback 已写入下方「日志」页。\n\n"
+                f"数据目录：{BASE_DIR}\n"
+                "若这里是只读位置，无法创建日志/设置文件。")
+
+    def _start_impl(self):
         import random as _random
         cfg = self._collect_config()
         if self.current_mode() == "vscode":
@@ -541,6 +609,10 @@ class App(tk.Tk):
         src_dir = self.src_dir_var.get().strip() or BASE_DIR
         mode = VSCodeMode(src_dir, exts=exts,
                           max_files=self.max_files_var.get())
+        # 枚举 + 读取全部目标文件是同步的；大目录要几秒。先把状态画出来，
+        # 否则用户只看到窗口无响应，以为卡在"定位文件"。
+        self.status.set(f"正在扫描 {src_dir} …")
+        self.update_idletasks()
         try:
             targets = collect_targets(mode)
         except ValueError as exc:
@@ -798,6 +870,14 @@ def selftest():
                                 "autotyper_selftest_settings.json")
     LOG_FILE = os.path.join(tempfile.gettempdir(),
                             "autotyper_selftest_log.csv")
+    # 上一轮自检若在 _save_settings() 之后崩溃/被中断，临时设置会留在
+    # %TEMP% 里。下一次 App() 会把它当成用户设置载入，于是"默认值"断言
+    # 随运行历史时红时绿。自检必须以干净状态启动。
+    for stale in (SETTINGS_JSON, LOG_FILE):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
     app = App()
     app.update_idletasks()
     cfg = app._collect_config()
@@ -1015,11 +1095,39 @@ def selftest():
     print("GUI SELFTEST PASSED")
 
 
+def _require_pynput(show_dialog=True):
+    """实机输入依赖 pynput；缺失时给出可操作的提示而不是 Tk 回调里的裸 traceback。"""
+    try:
+        import pynput  # noqa: F401
+        return True
+    except Exception as exc:
+        msg = (
+            "实机输入依赖 pynput，但当前 Python 环境无法导入它。\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            "请确认用装了依赖的解释器启动（本机默认 py 可能不是它）：\n"
+            "  py -3.11 -m pip install pynput\n"
+            "  py -3.11 -m humanized_autotyper.gui")
+        print(msg)
+        if show_dialog:
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                messagebox.showerror("缺少依赖 pynput", msg)
+                root.destroy()
+            except Exception:
+                pass
+        return False
+
+
 def main():
     """命令行入口：`autotyper-gui`（等同 python -m humanized_autotyper.gui）。"""
     if "--selftest" in sys.argv[1:]:
+        if not _require_pynput(show_dialog=False):
+            return 1
         selftest()
         return 0
+    if not _require_pynput():
+        return 1
     App().mainloop()
     return 0
 

@@ -1552,9 +1552,9 @@ def test_vscode_before_type_clears_document():
     assert seq[0] == ("combo", "ctrl+p"), f"必须先开 Quick Open: {seq}"
     assert seq[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
         f"结尾必须是 Ctrl+A + Delete 清空: {seq}"
-    assert ("tap", "return") in seq, f"敲完路径要按 Enter: {seq}"
+    assert ("tap", "enter") in seq, f"敲完路径要按 Enter: {seq}"
     # Enter 必须在清空之前
-    i_enter = seq.index(("tap", "return"))
+    i_enter = seq.index(("tap", "enter"))
     i_clear = seq.index(("combo", "ctrl+a"))
     assert i_enter < i_clear, f"先打开文件再清空: {seq}"
     # 路径逐字符输入，且用的是相对 src_dir 的正斜杠路径
@@ -1642,6 +1642,22 @@ def test_combo_keys_use_real_pynput_names():
     # _tap_special 用的名字也必须存在
     for name in ("enter", "backspace", "delete", "left", "right", "up", "down"):
         getattr(Key, name)
+
+    # _tap_special 在 dry-run 下提前 return，只有实机才 getattr——名字写错
+    # （如 return/escape）会被 dry-run 测试绿灯放过。直接扫描源码调用点，
+    # 逐个对着真实 Key 校验，避免同类事故再次发生。
+    import pathlib
+    import re
+    pkg_dir = pathlib.Path(__file__).resolve().parent
+    used = set()
+    for py in pkg_dir.glob("*.py"):
+        if py.name == "sanity_check.py":
+            continue
+        text = py.read_text(encoding="utf-8")
+        used |= set(re.findall(r'_tap_special\("([a-z_]+)"', text))
+    assert "enter" in used, "VSCode 模式打开文件必须按 enter"
+    for name in sorted(used):
+        assert hasattr(Key, name), f"_tap_special 用了不存在的 Key.{name}"
 
     # executor 里实际用到的组合键解析也要能跑通
     from .executor import Executor, Killer, Logger

@@ -1,0 +1,15 @@
+{
+  "editor.autoIndent": "none",
+  "editor.autoClosingBrackets": "never",
+  "editor.autoClosingQuotes": "never",
+  "editor.autoSurround": "never",
+  "editor.quickSuggestions": {
+    "comments": "off",
+    "strings": "off",
+    "other": "off"
+},
+  "editor.acceptSuggestionOnEnter": "off",
+  "editor.formatOnSave": false,
+  "editor.formatOnType": false,
+  "editor.detectIndentation": false
+}

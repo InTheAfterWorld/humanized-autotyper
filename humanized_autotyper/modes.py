@@ -353,7 +353,7 @@ class VSCodeMode(Mode):
                          active=False)
         # 关键：等 Quick Open 过滤收敛，否则 Enter 可能打开半匹配的文件
         typer._sleep(self.open_settle_s, active=False)
-        ex._tap_special("return")
+        ex._tap_special("enter")
         typer._sleep(self.open_settle_s, active=False)
 
         if target.path in self._opened:
