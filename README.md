@@ -56,10 +56,10 @@ autotyper-gui          # 或 py -m humanized_autotyper.gui
 | 模式 | 内容来源 | 结束校验 |
 |---|---|---|
 | 单文件（任意编辑器） | 「内容」页 | 内存缓冲区与文本一致 |
-| VSCode（目录多文件） | 磁盘文件（填起始文件夹 + 扩展名） | 逐文件存盘后回读磁盘比对 |
+| VSCode（目录多文件） | 源文件夹（只读） | 目标文件夹逐文件存盘后回读磁盘比对 |
 
-选 VSCode 模式时「内容」页会自动隐藏（内容来自磁盘），并展开**起始文件夹 /
-扩展名 / 最多处理文件数**三个输入框。
+选 VSCode 模式时「内容」页会自动隐藏（内容来自源文件夹），并展开**源文件夹 /
+目标文件夹 / 扩展名 / 最多处理文件数**输入框。
 
 - **预检**：点「开始真实输入」时先检查文件夹与 VSCode 设置，不通过会弹框，
   并附上可直接复制的 `settings.json` 片段。
@@ -187,12 +187,39 @@ autotyper-gui --selftest                   # 无界面 GUI 自检
 ### VSCode 模式
 
 ```bash
-# 1) 先看需要改哪些配置（dry-run 最稳）
-autotyper --mode vscode --src-dir ./src --ext .py --dry-run
+# 1) 源目录只读，目标目录接收结果
+autotyper --mode vscode `
+  --source-dir ".\Humanized Autotyper" `
+  --target-dir ".\Demooo" `
+  --ext .py --dry-run
 
 # 2) 确认 VSCode 已按提示关掉自动行为，再实机跑
-autotyper --mode vscode --src-dir ./src --ext .py --live --window "Visual Studio Code"
+autotyper --mode vscode `
+  --source-dir ".\Humanized Autotyper" `
+  --target-dir ".\Demooo" `
+  --ext .py --live --window "Visual Studio Code"
 ```
+
+VSCode 模式现在区分**源文件夹**和**目标文件夹**。源文件夹只读，目标文件夹负责
+创建目录/文件、接收模拟输入和保存校验；源目录不会被清空或修改。目标文件夹同时
+是 VS Code 工作区根目录，运行前请在 VS Code 中打开它。目标目录缺少 `.vscode/settings.json`
+时，程序会自动写入本工具所需的安全设置；已有配置不会覆盖，只会在预检中报告冲突。
+
+VSCode 模式默认使用 `code --reuse-window --goto` 定位目标文件，再用现有键盘层
+模拟真实输入；文件创建、扫描和保存后的校验始终由程序直接处理。如果 `code`
+命令不在 PATH，真实输入会在预检阶段拒绝启动，而不会静默改用不可靠的定位方式。
+需要纯快捷键实验时可显式选择：
+
+```bash
+autotyper --mode vscode --source-dir ".\Humanized Autotyper" \
+  --target-dir ".\Demooo" --locator keyboard --live \
+  --window "Visual Studio Code"
+```
+
+`--locator auto`（默认）为 CLI 优先，`--locator cli` 强制使用 VS Code CLI，
+`--locator keyboard` 使用 `Ctrl+P` Quick Open 兼容路径。dry-run 不需要本机安装
+`code` 命令；真实输入建议使用 `auto` 或 `cli`。旧的 `--src-dir` 仍可作为
+`--source-dir` 的兼容别名；未提供 `--target-dir` 时目标目录等于源目录。
 
 **启动前必须先满足**（preflight 会逐项检查，不满足直接拒绝启动）：
 
@@ -212,13 +239,20 @@ autotyper --mode vscode --src-dir ./src --ext .py --live --window "Visual Studio
 
 不满足时命令会打印可直接复制的配置片段。
 
+`editor.quickSuggestions` 也接受对象写法
+`{"other": "off", "comments": "off", "strings": "off"}`（三项都关即等价于
+`false`）。目录里的空文件（含只有空白字符的文件）会自动跳过并在日志里列出，
+不会阻塞启动；`*.egg-info` 等打包元数据目录不参与枚举。
+
 > ⚠️ **与单文件模式的根本差异**：VSCode 会自动改写输入，且每个文件都会重置
 > 缓冲区，所以**内存缓冲区不再等于文档**。因此该模式下 `final_matches_source`
 > 会报 `None`，正确性只认 `per_file` 里逐文件回读磁盘的结果。
 > **F10 中断可能留下半截文件**，请在 git 仓库内运行。
 
-每个文件的动作序列是：`Ctrl+P` → 输入路径 → `Enter` → **`Ctrl+A` + `Delete`
-清空文档** → 打字 → `Ctrl+S` 存盘 → 回读磁盘比对。
+CLI 定位时每个文件的动作序列是：程序先在目标目录创建对应文件，随后
+`code --goto` 打开目标 → **`Ctrl+A` +
+`Delete` 清空文档** → 打字 → `Ctrl+S` 存盘 → 回读磁盘比对。快捷键兼容模式
+则把第一步替换为 `Ctrl+P` → 输入工作区相对路径 → `Enter`。
 
 清空那一步不可省：Quick Open 只是**切换**标签页，文档里还留着上次的内容，
 而每个文件的缓冲区是从空的起步的——不清空就会把新文本插到旧内容中间。

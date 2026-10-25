@@ -1255,6 +1255,11 @@ def _make_vscode_tree(d):
         "sub/.hidden.py": "should be skipped\n",
         "binary.py": "\x00\x01binary\n",          # 扩展名对但内容含控制字符
         "skip.bin": "ignored by ext\n",
+        "empty.txt": "",
+        "whitespace.txt": "  \n",
+        # 打包元数据目录：即使里面有 .txt 也不该被当成目标
+        "humanized_autotyper.egg-info/dependency_links.txt": "",
+        "humanized_autotyper.egg-info/top_level.txt": "humanized_autotyper\n",
     }
     for rel, content in layout.items():
         full = os.path.join(d, *rel.split("/"))
@@ -1280,6 +1285,14 @@ def test_vscode_enumeration():
         # 必须跳过的
         for bad in ("node_modules", "__pycache__", ".hidden", "should be skipped"):
             assert not any(bad in p for p in rels), f"不该收 {bad}: {rels}"
+        # 空文件 / 纯空白文件：没有内容可重打，跳过而不是阻断整轮
+        assert not any(p.endswith(("empty.txt", "whitespace.txt")) for p in rels)
+        assert any(p.endswith("empty.txt") for p in m.skipped_empty), \
+            m.skipped_empty
+        assert any(p.endswith("whitespace.txt") for p in m.skipped_empty), \
+            m.skipped_empty
+        # 打包元数据目录整个跳过（即使里面有非空 .txt）
+        assert not any("egg-info" in p for p in rels), rels
         # 路径必须是正斜杠（Quick Open 用）
         assert not any("\\" in p for p in rels), f"路径应统一正斜杠: {rels}"
         # 必须相对 src_dir：Quick Open 匹配的是工作区相对路径，出现 ../.. 就废了
@@ -1310,6 +1323,29 @@ def test_vscode_enumeration():
     print(f"PASS vscode_enumeration files={len(rels)}")
 
 
+def test_vscode_source_target_preparation():
+    """目标目录接收创建的文件，源目录内容保持只读。"""
+    from .modes import VSCodeMode
+
+    with tempfile.TemporaryDirectory() as d:
+        source = os.path.join(d, "source")
+        target = os.path.join(d, "target")
+        os.makedirs(os.path.join(source, "nested"))
+        source_file = os.path.join(source, "nested", "a.py")
+        with open(source_file, "w", encoding="utf-8") as f:
+            f.write("print('source')\n")
+
+        mode = VSCodeMode(source, target_dir=target, settings_paths=[])
+        targets = mode.iter_targets()
+        target_file = os.path.join(target, "nested", "a.py")
+        assert os.path.isfile(target_file), "目标文件应由枚举阶段创建"
+        assert targets[0].abs_path == target_file
+        assert targets[0].content == "print('source')\n"
+        with open(source_file, "r", encoding="utf-8") as f:
+            assert f.read() == "print('source')\n"
+    print("PASS vscode_source_target_preparation")
+
+
 def test_vscode_preflight_blocks_bad_setup():
     """preflight 必须拦住：设置没关干净、文件不可读、含控制字符。"""
     from .modes import VSCodeMode, VSCODE_REQUIRED_SETTINGS
@@ -1336,6 +1372,28 @@ def test_vscode_preflight_blocks_bad_setup():
         # 控制字符文件必须被单独拦下
         assert [e for e in errs2 if "无法可靠键入" in e], \
             f"binary.py 的控制字符应被拦: {errs2}"
+
+        # 2b) quickSuggestions 的对象写法（三项全 off）与 false 等价
+        good_obj = {**good, "editor.quickSuggestions": {
+            "other": "off", "comments": "off", "strings": "off"}}
+        with open(settings, "w", encoding="utf-8") as f:
+            json.dump(good_obj, f)
+        m2b = VSCodeMode(root, settings_paths=[settings])
+        errs2b = m2b.preflight(m2b.iter_targets())
+        assert not [e for e in errs2b if "quickSuggestions" in e], errs2b
+        assert not [e for e in errs2b if "文件为空" in e], \
+            f"空文件应自动跳过，不该阻断: {errs2b}"
+        # other 没关掉 -> 仍然必须报错
+        bad_obj = {**good, "editor.quickSuggestions": {
+            "other": "on", "comments": "off", "strings": "off"}}
+        with open(settings, "w", encoding="utf-8") as f:
+            json.dump(bad_obj, f)
+        m2c = VSCodeMode(root, settings_paths=[settings])
+        errs2c = m2c.preflight(m2c.iter_targets())
+        assert [e for e in errs2c if "quickSuggestions" in e], errs2c
+        # 恢复正确设置，供后续层级覆盖测试使用
+        with open(settings, "w", encoding="utf-8") as f:
+            json.dump(good, f)
 
         # 3) workspace 覆盖 user：后读的层级赢
         user = os.path.join(d, "user.json")
@@ -1715,6 +1773,7 @@ def main():
     test_combo_keys_dry_run_and_ordering()
     test_combo_keys_use_real_pynput_names()
     test_vscode_enumeration()
+    test_vscode_source_target_preparation()
     test_vscode_preflight_blocks_bad_setup()
     test_vscode_verify_reports_diff()
     test_vscode_reread_matches_disk()

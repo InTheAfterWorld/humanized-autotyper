@@ -101,8 +101,18 @@ def parse_args(argv):
     p.add_argument("--mode", default="notepad", metavar="NAME",
                    help=f"typing mode, one of: {', '.join(mode_names())} "
                         "(default: notepad; --mode list for details)")
-    p.add_argument("--src-dir", default=".",
-                   help="vscode mode: source directory to enumerate")
+    p.add_argument("--source-dir", "--src-dir", dest="source_dir",
+                   default=".",
+                   help="vscode mode: source directory to read")
+    p.add_argument("--target-dir", default="",
+                   help="vscode mode: destination/workspace directory "
+                        "(defaults to source directory)")
+    p.add_argument("--workspace-root", default="",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--locator", choices=("auto", "cli", "keyboard"),
+                   default="auto",
+                   help="vscode file locator: auto/cli/keyboard "
+                        "(default: auto, CLI-first)")
     p.add_argument("--ext", default=",".join(DEFAULT_EXTS), metavar="LIST",
                    help="vscode mode: comma-separated extensions to include")
     p.add_argument("--max-files", type=int, default=0,
@@ -123,7 +133,14 @@ def _build_mode(args):
     """
     if args.mode == "vscode":
         exts = [e.strip() for e in args.ext.split(",") if e.strip()]
-        mode = VSCodeMode(args.src_dir, exts=exts, max_files=args.max_files)
+        mode = VSCodeMode(
+            args.source_dir, exts=exts,
+            source_dir=args.source_dir,
+            target_dir=args.target_dir or args.source_dir,
+            workspace_root=(args.workspace_root or
+                            args.target_dir or args.source_dir),
+            locator=args.locator, require_cli=args.live,
+            max_files=args.max_files)
         try:
             targets = collect_targets(mode)
         except ValueError as exc:
@@ -134,6 +151,11 @@ def _build_mode(args):
             for k, (v, why) in VSCODE_REQUIRED_SETTINGS.items():
                 print(f'  "{k}": {json.dumps(v)},   # 否则{why}')
             raise SystemExit(1)
+        if mode.skipped_empty:
+            shown = ", ".join(mode.skipped_empty[:5])
+            extra = (f" ... ({len(mode.skipped_empty)} total)"
+                     if len(mode.skipped_empty) > 5 else "")
+            print(f"NOTE: skipped empty file(s): {shown}{extra}")
         return mode, targets
     return None, None
 
@@ -200,7 +222,8 @@ def main(argv=None):
         typer_mode = SingleFileMode(source, source_desc)
     else:
         source = ""
-        source_desc = f"{args.src_dir} ({args.ext})"
+        source_desc = (f"{args.source_dir} -> "
+                       f"{args.target_dir or args.source_dir} ({args.ext})")
 
     rng = random.Random(args.seed)
     if targets is None:

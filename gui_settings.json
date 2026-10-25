@@ -16,12 +16,15 @@
  "speed_multiplier": 1.0,
  "_preset": "标准",
  "_countdown": 5,
+ "_long_horizon_on": false,
  "_long_on": true,
  "_file_switch_on": false,
  "_file_switch_chars": 200,
  "_window": "",
  "_mode": "VSCode（目录多文件）",
  "_src_dir": "C:\\Users\\George Luo\\Documents\\VSCode\\Humanized Autotyper",
+ "_target_dir": "C:/Users/George Luo/Documents/VSCode/Demoooo",
+ "_locator": "自动（推荐，VS Code CLI）",
  "_ext": ".py,.js,.jsx,.ts,.tsx,.md,.txt,.json,.yaml,.yml",
  "_max_files": 0
 }

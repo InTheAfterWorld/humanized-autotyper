@@ -300,6 +300,28 @@ class App(tk.Tk):
         ttk.Button(r1, text="浏览…", command=self._pick_dir)\
             .pack(side="left")
 
+        rws = ttk.Frame(self.vs_panel)
+        rws.pack(fill="x", pady=2)
+        ttk.Label(rws, text="目标文件夹").pack(side="left")
+        self.target_dir_var = tk.StringVar(
+            value=os.path.join(BASE_DIR, "Demooo"))
+        ttk.Entry(rws, textvariable=self.target_dir_var, width=42)\
+            .pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(rws, text="浏览…",
+                   command=lambda: self._pick_target_dir())\
+            .pack(side="left")
+
+        rloc = ttk.Frame(self.vs_panel)
+        rloc.pack(fill="x", pady=2)
+        ttk.Label(rloc, text="文件定位方式").pack(side="left")
+        self.locator_var = tk.StringVar(value="自动（推荐，VS Code CLI）")
+        self.locator_cb = ttk.Combobox(
+            rloc, textvariable=self.locator_var, state="readonly", width=28,
+            values=["自动（推荐，VS Code CLI）",
+                    "VS Code CLI",
+                    "Ctrl+P 快捷键（实验）"])
+        self.locator_cb.pack(side="left", padx=6)
+
         r2 = ttk.Frame(self.vs_panel)
         r2.pack(fill="x", pady=2)
         ttk.Label(r2, text="扩展名").pack(side="left")
@@ -433,6 +455,8 @@ class App(tk.Tk):
         data["_window"] = self.window_var.get()
         data["_mode"] = self.mode_var.get()
         data["_src_dir"] = self.src_dir_var.get()
+        data["_target_dir"] = self.target_dir_var.get()
+        data["_locator"] = self.locator_var.get()
         data["_ext"] = self.ext_var.get()
         data["_max_files"] = self.max_files_var.get()
         try:
@@ -469,6 +493,10 @@ class App(tk.Tk):
                     self.mode_var.set(str(v))
             elif k == "_src_dir":
                 self.src_dir_var.set(str(v))
+            elif k in ("_workspace", "_target_dir"):
+                self.target_dir_var.set(str(v))
+            elif k == "_locator":
+                self.locator_var.set(str(v))
             elif k == "_ext":
                 self.ext_var.set(str(v))
             elif k == "_max_files":
@@ -504,9 +532,15 @@ class App(tk.Tk):
             self.status.set("单文件模式：在「内容」页填写要输入的文字")
 
     def _pick_dir(self):
-        d = filedialog.askdirectory(title="选择要处理的起始文件夹")
+        d = filedialog.askdirectory(title="选择源文件夹")
         if d:
             self.src_dir_var.set(d)
+
+    def _pick_target_dir(self):
+        d = filedialog.askdirectory(
+            initialdir=self.target_dir_var.get() or BASE_DIR)
+        if d:
+            self.target_dir_var.set(d)
 
     # ------------------------------------------------------------ 运行
     def _log_line(self, line):
@@ -607,7 +641,16 @@ class App(tk.Tk):
                                  "请至少填写一个扩展名，例如 .py")
             return None
         src_dir = self.src_dir_var.get().strip() or BASE_DIR
-        mode = VSCodeMode(src_dir, exts=exts,
+        target_dir = self.target_dir_var.get().strip() or os.path.join(
+            BASE_DIR, "Demooo")
+        locator = {
+            "自动（推荐，VS Code CLI）": "auto",
+            "VS Code CLI": "cli",
+            "Ctrl+P 快捷键（实验）": "keyboard",
+        }.get(self.locator_var.get(), "auto")
+        mode = VSCodeMode(src_dir, source_dir=src_dir, target_dir=target_dir,
+                          workspace_root=target_dir, locator=locator,
+                          require_cli=not cfg.dry_run,
                           max_files=self.max_files_var.get())
         # 枚举 + 读取全部目标文件是同步的；大目录要几秒。先把状态画出来，
         # 否则用户只看到窗口无响应，以为卡在"定位文件"。
@@ -618,6 +661,11 @@ class App(tk.Tk):
         except ValueError as exc:
             self._show_preflight_error(str(exc))
             return None
+        if mode.skipped_empty:
+            shown = ", ".join(mode.skipped_empty[:5])
+            extra = (f" 等 {len(mode.skipped_empty)} 个"
+                     if len(mode.skipped_empty) > 5 else "")
+            self._log_line(f"已跳过空文件：{shown}{extra}")
         # 逐文件进度：done/total/path
         cfg.progress_hook = lambda done, total, t: self.q.put(
             ("file", (done, total, t.path)))
@@ -1003,6 +1051,7 @@ def selftest():
                        VSCODE_REQUIRED_SETTINGS.items()}, f)
         shown.clear()
         app.src_dir_var.set(ok_dir)
+        app.target_dir_var.set(ok_dir)
         cfg2 = app._collect_config()
         ty = app._make_vscode_typer(cfg2, random)
         assert ty is not None, f"合规配置下应构造成功: {shown}"

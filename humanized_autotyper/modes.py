@@ -14,6 +14,8 @@ AutoTyper 的主循环 (`machine.py::AutoTyper.run`) 本身不认识"文档"也�
 """
 import json
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -140,6 +142,31 @@ VSCODE_REQUIRED_SETTINGS = {
                                  "会按文件已有内容猜 tab/space，不同文件会不一致"),
 }
 
+
+def _quick_suggestions_off(value) -> bool:
+    """quickSuggestions 既支持 false，也支持按语言分项的对象写法。
+
+    VSCode 的等价写法：
+        "editor.quickSuggestions": false
+        "editor.quickSuggestions": {"other": "off", "comments": "off",
+                                    "strings": "off"}
+    省略的键会回落到默认值：comments/strings 默认关，other 默认**开**，
+    所以 other 必须显式关掉；写出来的项也不允许是开启状态。
+    """
+    if value is False:
+        return True
+    if isinstance(value, dict):
+        if value.get("other", True) not in (False, "off"):
+            return False
+        return all(v in (False, "off") for v in value.values())
+    return False
+
+
+def _setting_ok(key: str, got, want) -> bool:
+    if key == "editor.quickSuggestions":
+        return _quick_suggestions_off(got)
+    return got == want
+
 DEFAULT_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx", ".md", ".txt",
                 ".json", ".yaml", ".yml")
 
@@ -151,8 +178,27 @@ SKIP_DIRS = frozenset({
 })
 
 
+def _ensure_file_exists(path: str) -> None:
+    """确保目标文件在磁盘上存在，供 VSCode Quick Open 定位。
+
+    VSCode 的 Quick Open 只能打开**已经存在于工作区**的文件：文件若从未
+    创建/保存过，Quick Open 找不到它，Enter 也不会打开任何东西，后续的
+    Ctrl+A/Delete 会作用在错误的文档上，整轮看起来就像“卡住”了。这里在
+    真正发键前把空文件建好（父目录一并创建），让 Quick Open 能定位到它；
+    真正的内容随后由打字过程写入并 Ctrl+S 落盘。
+    """
+    if not path or os.path.exists(path):
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8"):
+        pass
+
+
+
 class VSCodeMode(Mode):
-    """把一个目录下的多个文件逐个打进 VSCode。
+    """把源目录中的多个文件逐个打进目标 VS Code 工作区。
 
     与 SingleFileMode 的根本差异：**内存缓冲区不再等于真实文档**。
     VSCode 会自动缩进/补全/格式化（见 VSCODE_REQUIRED_SETTINGS），而且每个
@@ -165,9 +211,29 @@ class VSCodeMode(Mode):
     multi_target = True
 
     def __init__(self, src_dir: str, exts=None, rel_prefix: str = "",
+                 source_dir: Optional[str] = None,
+                 target_dir: Optional[str] = None,
+                 workspace_root: Optional[str] = None,
+                 locator: str = "auto",
+                 require_cli: bool = False,
                  settings_paths=None, max_files: int = 0,
                  open_settle_s: float = 0.6, save_settle_s: float = 0.8):
-        self.src_dir = src_dir
+        # src_dir remains as a compatibility alias for callers from 1.x.
+        self.source_dir = source_dir or src_dir
+        default_target = (os.path.dirname(self.source_dir)
+                          if os.path.isfile(self.source_dir)
+                          else self.source_dir)
+        self.target_dir = target_dir or default_target
+        self.src_dir = self.source_dir
+        default_workspace = (os.path.dirname(self.target_dir)
+                              if os.path.isfile(self.target_dir)
+                              else self.target_dir)
+        self.workspace_root = os.path.abspath(
+            workspace_root or default_workspace)
+        self.locator = locator.lower().strip()
+        self.require_cli = require_cli
+        if self.locator not in ("auto", "cli", "keyboard"):
+            raise ValueError("locator must be one of: auto, cli, keyboard")
         self.exts = tuple(e if e.startswith(".") else "." + e
                           for e in (exts or DEFAULT_EXTS))
         self.rel_prefix = rel_prefix.replace("\\", "/").strip("/")
@@ -185,6 +251,32 @@ class VSCodeMode(Mode):
         # 交替打字会重访同一文件：记录已打开过的路径，重访时不再清空文档，
         # 只把光标压到文末接着打（否则会把已打的一半删掉）。
         self._opened: set = set()
+        # 枚举时跳过的空文件（没有内容可重打）。GUI/CLI 会提示，避免用户
+        # 以为这些文件被漏掉了。
+        self.skipped_empty: List[str] = []
+
+    @staticmethod
+    def _code_command() -> Optional[str]:
+        return shutil.which("code") or shutil.which("code.cmd")
+
+    def resolved_locator(self) -> str:
+        if self.locator != "auto":
+            return self.locator
+        return "cli" if self._code_command() else "keyboard"
+
+    def _prepare_workspace_settings(self) -> None:
+        """Create target-only safety settings without overwriting user files."""
+        if self._explicit_settings:
+            return
+        path = os.path.join(self.target_dir, ".vscode", "settings.json")
+        if os.path.exists(path):
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({key: value for key, (value, _)
+                       in VSCODE_REQUIRED_SETTINGS.items()},
+                      f, ensure_ascii=False, indent=2)
+            f.write("\n")
 
     @staticmethod
     def _default_settings():
@@ -197,40 +289,69 @@ class VSCodeMode(Mode):
     # ---------------------------------------------------------- 文件枚举
     def iter_targets(self, source: Optional[str] = None,
                      **kwargs) -> List[Target]:
-        root = self.src_dir
-        if os.path.isfile(root):
-            return [self._make_target(os.path.dirname(root) or ".",
-                                      os.path.basename(root))]
+        root = self.source_dir
+        self.skipped_empty = []
+        if os.path.isdir(root):
+            os.makedirs(self.target_dir, exist_ok=True)
+            self._prepare_workspace_settings()
+        if os.path.isfile(root) or (
+                not os.path.isdir(root)
+                and os.path.splitext(root)[1].lower() in self.exts):
+            if not os.path.isfile(root):
+                return []
+            target = self._make_target(
+                os.path.dirname(root) or ".", os.path.basename(root))
+            if not target.meta.get("error") and not target.content.strip():
+                self.skipped_empty.append(target.path)
+                return []
+            return [target]
         targets: List[Target] = []
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames
-                                 if d not in SKIP_DIRS and not d.startswith("."))
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in SKIP_DIRS and not d.startswith(".")
+                and not d.lower().endswith(".egg-info"))
             for fn in sorted(filenames):
                 if fn.startswith("."):
                     continue          # 隐藏文件（.env / .hidden.py）一律跳过
                 if fn.endswith(self.exts):
-                    targets.append(self._make_target(dirpath, fn))
+                    target = self._make_target(dirpath, fn)
+                    if not target.meta.get("error") and not target.content.strip():
+                        # 空文件没有可重打的内容。把它当阻断错误会让目录里
+                        # 任何一个空占位文件（test.txt、egg-info 里的空文件）
+                        # 卡住整轮；记录后跳过，GUI/CLI 会给出提示。
+                        self.skipped_empty.append(target.path)
+                        continue
+                    targets.append(target)
         if self.max_files and len(targets) > self.max_files:
             targets = targets[:self.max_files]
         return targets
 
     def _make_target(self, dirpath, filename) -> Target:
-        abs_path = os.path.join(dirpath, filename)
+        source_path = os.path.join(dirpath, filename)
+        source_root = self.source_dir
+        if os.path.isfile(source_root):
+            source_root = os.path.dirname(source_root) or "."
+        rel_path = os.path.relpath(source_path, source_root)
+        target_path = os.path.join(self.target_dir, rel_path)
+        _ensure_file_exists(target_path)
+
         try:
                 # utf-8-sig：源文件常带 UTF-8 BOM。若用纯 utf-8 读，BOM 会变成
                 # 内容首字符 U+FEFF——它**打不出来**（KeyCode.from_char 返回
                 # None，type_char 静默跳过而 buffer 照样记录），且 0xFEFF > 0x20
                 # 所以 unsupported_chars 也抓不到。只能在这里剥掉。
-                with open(abs_path, "r", encoding="utf-8-sig") as f:
+                with open(source_path, "r", encoding="utf-8-sig") as f:
                     content = f.read()
         except (UnicodeDecodeError, OSError) as exc:
             # 读不出来的文件不该让整轮失败：标记出来，preflight 会报
-            return Target(path=self._rel(abs_path), content="",
-                          abs_path=abs_path, meta={"error": repr(exc)})
+            return Target(path=self._rel(target_path), content="",
+                          abs_path=target_path, meta={"error": repr(exc)})
         # 与 main.read_source 一致：统一换行，否则缓冲区记 \r 而编辑器收到回车
         content = content.replace("\r\n", "\n").replace("\r", "\n")
-        return Target(path=self._rel(abs_path), content=content,
-                      abs_path=abs_path)
+        return Target(path=self._rel(target_path), content=content,
+                      abs_path=target_path,
+                      meta={"source_path": os.path.abspath(source_path)})
 
     def _rel(self, abs_path) -> str:
         """相对**起始文件夹**的路径（正斜杠）。
@@ -238,7 +359,7 @@ class VSCodeMode(Mode):
         必须是相对 src_dir 而不是 cwd：Quick Open 匹配的是「工作区相对路径」，
         若按 cwd 算，src_dir 在工作区之外时会得到一串 ../../../..，根本匹配不上。
         """
-        base = self.src_dir
+        base = self.target_dir
         if os.path.isfile(base):
             base = os.path.dirname(base) or "."
         try:
@@ -257,8 +378,8 @@ class VSCodeMode(Mode):
         """
         if self._explicit_settings:
             return self.settings_paths
-        local = os.path.join(self.src_dir, ".vscode", "settings.json")
-        if os.path.isdir(self.src_dir) and os.path.exists(local):
+        local = os.path.join(self.target_dir, ".vscode", "settings.json")
+        if os.path.isdir(self.target_dir) and os.path.exists(local):
             return self._default_settings()[:-1] + [local]
         return self._default_settings()
 
@@ -287,11 +408,32 @@ class VSCodeMode(Mode):
         from .keymap import unsupported_chars
 
         errs: List[str] = []
-        if not os.path.isdir(self.src_dir) and not os.path.isfile(self.src_dir):
-            errs.append(f"起始文件夹不存在: {self.src_dir}")
+        if not os.path.isdir(self.source_dir) and not os.path.isfile(self.source_dir):
+            errs.append(f"源文件夹不存在: {self.source_dir}")
             return errs
+        if not os.path.isdir(self.target_dir):
+            errs.append(f"目标文件夹不存在且无法准备: {self.target_dir}")
+        if not os.path.isdir(self.workspace_root):
+            errs.append(f"VS Code 工作区根目录不存在: {self.workspace_root}")
+        else:
+            for target in targets:
+                if not target.abs_path:
+                    continue
+                try:
+                    inside = (os.path.normcase(os.path.commonpath(
+                        [os.path.abspath(target.abs_path),
+                         self.workspace_root])) ==
+                              os.path.normcase(self.workspace_root))
+                except ValueError:
+                    inside = False
+                if not inside:
+                    errs.append(f"{target.path}: 不在 VS Code 工作区根目录 "
+                                f"{self.workspace_root} 内")
+        if self.require_cli and self.resolved_locator() != "cli":
+            errs.append("找不到 VS Code CLI 命令 code。请把 VS Code 的 bin "
+                        "目录加入 PATH，或选择 keyboard 定位方式。")
         if not targets:
-            errs.append(f"在 {self.src_dir} 下没找到任何匹配 "
+            errs.append(f"在 {self.source_dir} 下没找到任何匹配 "
                         f"{'/'.join(self.exts)} 的文件")
         for t in targets:
             if t.meta.get("error"):
@@ -309,9 +451,14 @@ class VSCodeMode(Mode):
             errs.append(f"settings.json 读取失败: {e}")
         for key, (want, why) in VSCODE_REQUIRED_SETTINGS.items():
             got = settings.get(key, "<未设置>")
-            if got != want:
-                errs.append(f"VSCode 设置 {key} 当前是 {got!r}，需要 {want!r}"
-                            f"——否则{why}")
+            if _setting_ok(key, got, want):
+                continue
+            hint = ""
+            if key == "editor.quickSuggestions":
+                hint = ('（也可以写成 {"other": "off", "comments": "off", '
+                        '"strings": "off"}）')
+            errs.append(f"VSCode 设置 {key} 当前是 {got!r}，需要 {want!r}"
+                        f"——否则{why}{hint}")
         return errs
 
     def editor_warnings(self) -> List[str]:
@@ -340,9 +487,60 @@ class VSCodeMode(Mode):
         ex = typer.executor
         if getattr(typer.cfg, "dry_run", True):
             return                      # dry-run 不发键，但流程照走以便审计
+        # 文件若尚未创建，Quick Open 定位不到它会“卡住”；这里先建好空文件。
+        abs_path = target.abs_path
+        if abs_path is not None:
+            _ensure_file_exists(abs_path)
+
+        if self.resolved_locator() == "cli" and target.abs_path:
+            self._open_with_cli(target, typer)
+        elif self.locator == "cli":
+            raise RuntimeError(f"CLI 定位需要目标文件绝对路径: {target.path}")
+        else:
+            self._open_with_keyboard(target, typer)
+
+        if target.path in self._opened:
+            ex.key_doc_end()
+            typer._sleep(self.open_settle_s / 2, active=False)
+            typer.logger.log("FILE", "resumed", target.path, 0)
+            return
+        self._opened.add(target.path)
+
+        ex.key_select_all()
+        typer._sleep(self.open_settle_s / 2, active=False)
+        ex.delete_key()
+        typer._sleep(self.open_settle_s / 2, active=False)
+        typer.logger.log("FILE", "cleared", target.path, 0)
+
+    def _open_with_cli(self, target: Target, typer) -> None:
+        command = self._code_command()
+        if not command:
+            raise RuntimeError("VS Code CLI command 'code' is not available")
+        if not target.abs_path:
+            raise RuntimeError(f"目标文件没有绝对路径: {target.path}")
+        try:
+            result = subprocess.run(
+                [command, "--reuse-window", "--goto",
+                 os.path.abspath(target.abs_path)],
+                check=False, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"调用 VS Code CLI 失败: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"VS Code CLI 返回码 {result.returncode}"
+                + (f": {detail}" if detail else ""))
+        typer._sleep(self.open_settle_s, active=False)
+        typer.logger.log("FILE", "located_cli", target.path, 0)
+
+    def _open_with_keyboard(self, target: Target, typer) -> None:
+        ex = typer.executor
         if self.rel_prefix:
             # src_dir 不是工作区根目录时，Quick Open 需要带前缀
             quick_path = f"{self.rel_prefix}/{target.path}"
+        elif target.abs_path is not None:
+            # 新建文件可能尚未进入 Quick Open 的索引；绝对路径可直接定位它。
+            quick_path = os.path.abspath(target.abs_path)
         else:
             quick_path = target.path
         ex.key_quick_open()
@@ -355,26 +553,7 @@ class VSCodeMode(Mode):
         typer._sleep(self.open_settle_s, active=False)
         ex._tap_special("enter")
         typer._sleep(self.open_settle_s, active=False)
-
-        if target.path in self._opened:
-            # 交替打字的重访：文档里已有一半内容，绝不能清空。把光标压到
-            # 文末，接着上次的位置继续打。缓冲区此时也恢复到该文件的槽位，
-            # 两边都在末尾，对齐。
-            ex.key_doc_end()
-            typer._sleep(self.open_settle_s / 2, active=False)
-            typer.logger.log("FILE", "resumed", target.path, 0)
-            return
-        self._opened.add(target.path)
-
-        # --- 清空文档（仅首次打开）---
-        ex.key_select_all()
-        typer._sleep(self.open_settle_s / 2, active=False)
-        ex.delete_key()                  # 删掉选区；文件本就为空时是无害的空操作
-        typer._sleep(self.open_settle_s / 2, active=False)
-        # 光标现在位于文档开头 = 缓冲区起点，两边对齐。
-        # 不做断言：此时读不到屏幕，无法证明 VSCode 真的清干净了；
-        # 真正的确认在 after_type() 的存盘回读。
-        typer.logger.log("FILE", "cleared", target.path, 0)
+        typer.logger.log("FILE", "located_keyboard", target.path, 0)
 
     def save_only(self, target: Target, typer) -> None:
         """交替打字切走前 Ctrl+S 存一次盘（不做回读校验）。
