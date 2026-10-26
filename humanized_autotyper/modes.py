@@ -207,6 +207,36 @@ def _safe_escape(ex) -> None:
         ex.key_escape()
 
 
+def _foreground_window_title() -> Optional[str]:
+    """当前前台窗口标题，取不到时返回 None。
+
+    Windows 走 Win32 GetForegroundWindow + GetWindowTextW（与
+    executor.check_window 同款取法）；Linux 走 xdotool。返回 None 表示
+    "无法校验"（平台不支持 / 工具缺失 / 读取失败），调用方应据此放行，
+    而不是把它当成"校验失败"——否则 macOS 与无 xdotool 的 Linux 上
+    每个文件都会被拒。
+    """
+    if sys.platform.startswith("win"):
+        import ctypes
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            buf = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, buf, 512)
+            return buf.value or None
+        except Exception:
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            res = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                check=False, capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0:
+                return res.stdout.strip() or None
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return None
+
 
 class VSCodeMode(Mode):
     """把源目录中的多个文件逐个打进目标 VS Code 工作区。
@@ -588,6 +618,15 @@ class VSCodeMode(Mode):
         if not located:
             self._open_with_keyboard(target, typer)
 
+        # 定位守卫：定位器成功只代表"尝试过"，不代表此刻活动编辑器就是目标
+        # 文件。后续的 Ctrl+A / Delete / 打字全部作用在**活动文档**上——定位
+        # 错了就是删错、打错、存错。必须在任何破坏性按键之前确认。
+        if not self._verify_target_window(target, typer):
+            raise RuntimeError(
+                f"定位校验失败：VS Code 活动编辑器不是 {target.path}"
+                "（请确认 VS Code 已打开目标文件夹并保持前台）")
+        typer.logger.log("FILE", "located_ok", target.path, 0)
+
         if target.path in self._opened:
             # 文件此前已打开过：内容可能已打了一半，绝对不能清空。
             # 只需把光标压到文末即可接着上次的进度继续输入。
@@ -597,7 +636,7 @@ class VSCodeMode(Mode):
             return
         self._opened.add(target.path)
 
-        # 首次打开：防误删源文件与安全清空
+        # 首次打开：防误删源文件 + 编辑器内清空
         source_path = target.meta.get("source_path")
         is_source = False
         if abs_path and source_path:
@@ -612,25 +651,65 @@ class VSCodeMode(Mode):
             typer.logger.log("FILE", "source_skip_clear", target.path, 0)
             return
 
-        is_empty = False
-        if abs_path and os.path.exists(abs_path):
-            try:
-                # 目标文件若有历史内容，先在磁盘层面安全截断，避免盲发键盘删除误伤活动窗口
-                if os.path.getsize(abs_path) > 0:
-                    with open(abs_path, "w", encoding="utf-8"):
-                        pass
-                is_empty = (os.path.getsize(abs_path) == 0)
-            except OSError:
-                pass
+        # 清空只在编辑器内完成（README 的原始设计）：定位守卫已确认活动
+        # 编辑器就是目标文件，所以 Ctrl+A + Delete 清掉的是它的旧内容。
+        #
+        # 绝不在磁盘层面预先截断目标文件。那会在定位尚未验证时先毁掉磁盘
+        # 内容，而编辑器的内存缓冲不受影响——磁盘已空、文档仍是旧内容，打字
+        # 插进旧内容中间，Ctrl+S 把"旧+新"混写回去，回读必然不符；F10 中断
+        # 时更会留下一个被清空的文件（目标目录里所有文件都会这样被"删掉"）。
+        ex.key_select_all()
+        typer._sleep(self.open_settle_s / 2, active=False)
+        ex.delete_key()
+        typer._sleep(self.open_settle_s / 2, active=False)
+        typer.logger.log("FILE", "cleared", target.path, 0)
 
-        if is_empty:
-            typer.logger.log("FILE", "empty_skip_clear", target.path, 0)
-        else:
-            ex.key_select_all()
-            typer._sleep(self.open_settle_s / 2, active=False)
-            ex.delete_key()
-            typer._sleep(self.open_settle_s / 2, active=False)
-            typer.logger.log("FILE", "cleared", target.path, 0)
+    def _verify_target_window(self, target: Target, typer) -> bool:
+        """定位守卫：确认 VS Code 在前台、且活动编辑器就是目标文件。
+
+        定位器（code --goto / Quick Open）只负责"尝试打开"：CLI 的返回码
+        几乎恒定为 0，Quick Open 的 Enter 也可能打开模糊匹配到的其它文件。
+        而后续的 Ctrl+A / Delete / 打字作用于**当前活动文档**，所以这里是
+        唯一能在破坏性动作之前拦住"删错文件"的地方。
+
+        - 焦点：复用 check_window 的暂停语义；不匹配就等用户切回。
+        - 文档：VS Code 窗口标题含目标文件名与工作区/目标目录名。
+        - 取不到标题（macOS / 无 xdotool 的 Linux）：只记日志不阻断，
+          与 executor.check_window 的既有策略保持一致。
+        """
+        ex = typer.executor
+        if not ex.check_window():
+            typer.logger.log("WINDOW", "focus_wait", target.path, 0)
+            # check_window 只在"标题匹配"时撤销暂停，所以必须在循环里
+            # 重新调用它；干等 paused 标志是等不到恢复的。
+            while not typer.kill.killed():
+                time.sleep(0.2)
+                if ex.check_window():
+                    break
+            if typer.kill.killed():
+                return False
+        title = _foreground_window_title()
+        if title is None:
+            typer.logger.log("WINDOW", "verify_unavailable", target.path, 0)
+            return True
+        folded = title.casefold()
+        want_file = os.path.basename(
+            target.path.replace("/", os.sep)).casefold()
+        # VS Code 标题里的工作区名是用户实际打开的文件夹名，可能与自动探测
+        # 的 workspace_root 不同（例如打开了上一层目录）。接受 workspace_root
+        # 或 target_dir 任一名字，避免把"定位正确但工作区名不同"误判成失败。
+        names = {
+            os.path.basename(os.path.normpath(self.workspace_root)).casefold(),
+            os.path.basename(os.path.normpath(self.target_dir)).casefold(),
+        }
+        names.discard("")
+        if want_file and want_file in folded and (
+                not names or any(n in folded for n in names)):
+            return True
+        typer.logger.log(
+            "WINDOW", "verify_failed",
+            f"{target.path}: foreground={title!r}", 0)
+        return False
 
     def _open_with_cli(self, target: Target, typer) -> None:
         command = self._code_command()
@@ -818,8 +897,11 @@ class VSCodeLinuxMode(VSCodeMode):
         return warnings
 
     def before_type(self, target: Target, typer) -> None:
+        # 守卫依据前台窗口标题判定活动文档，所以必须先激活再走基类；
+        # 否则窗口还在后台时守卫必然失败，每个文件都会被判定位失败。
+        self._activate_window_linux(typer)
         super().before_type(target, typer)
-        # 问题 3：定位后强制激活并前置 VS Code 窗口
+        # CLI 定位/清空后桌面环境可能把焦点抢走，收尾再拉回一次。
         self._activate_window_linux(typer)
 
     @staticmethod

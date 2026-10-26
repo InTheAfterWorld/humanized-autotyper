@@ -3,6 +3,7 @@ import os
 import random
 import tempfile
 import time
+from contextlib import contextmanager
 from typing import Any, Dict
 
 from .config import Config
@@ -12,6 +13,23 @@ from .keymap import unsupported_chars, dyad_factor, FINGER
 from .typos import TypoEngine, is_typoable
 from .machine import AutoTyper, LongPauseScheduler
 from .main import DEMO_SOURCE, source_problem
+
+
+@contextmanager
+def fake_foreground_title(title):
+    """替换 modes._foreground_window_title，让定位守卫在自检里可控。
+
+    守卫读的是真实前台窗口标题；自检跑在终端里，标题永远不会匹配目标
+    文件名，所以每条走 before_type 的路径都必须显式声明"此刻前台是什么
+    窗口"，否则守卫失败、测试会在错误的地方断言。
+    """
+    from . import modes as modes_mod
+    original = modes_mod._foreground_window_title
+    modes_mod._foreground_window_title = lambda: title
+    try:
+        yield
+    finally:
+        modes_mod._foreground_window_title = original
 
 
 def test_buffer():
@@ -1153,6 +1171,7 @@ def test_vscode_before_type_resume_keeps_content():
     events = []
 
     class FakeExec:
+        def check_window(self):       return True
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def key_save(self):           events.append(("combo", "ctrl+s"))
@@ -1179,14 +1198,16 @@ def test_vscode_before_type_resume_keeps_content():
     tgt = Target(path="a.py", content="hello")
 
     # 首次：清空
-    m.before_type(tgt, FakeTyper())
+    with fake_foreground_title("a.py — proj - Visual Studio Code"):
+        m.before_type(tgt, FakeTyper())
     seq1 = [e for e in events if e[0] in ("combo", "key", "tap")]
     assert seq1[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
         f"首次结尾必须 Ctrl+A + Delete: {seq1}"
 
     # 重访：不清空，改为 Ctrl+End
     events.clear()
-    m.before_type(tgt, FakeTyper())
+    with fake_foreground_title("a.py — proj - Visual Studio Code"):
+        m.before_type(tgt, FakeTyper())
     seq2 = [e for e in events if e[0] in ("combo", "key", "tap")]
     assert ("combo", "ctrl+a") not in seq2, f"重访不该清空: {seq2}"
     assert ("key", "delete") not in seq2, f"重访不该删除: {seq2}"
@@ -1569,19 +1590,24 @@ def test_vscode_strips_bom():
 
 
 def test_vscode_before_type_clears_document():
-    """回归：打开文件后必须清空文档。
+    """回归：打开文件后必须清空文档，但清空只能发生在编辑器内。
 
     Quick Open 只是**切换**标签页，文档里还留着上次的内容；而每个文件的
     Buffer 是从空的起步的。不清空就会把新文本插到旧内容中间。
 
     这里锁定按下的**顺序**必须完整且正确：
     Ctrl+P -> 路径 -> Enter -> Ctrl+A -> Delete
+
+    同时锁定：before_type **不得修改磁盘文件**。磁盘截断会先毁掉目标
+    内容，而编辑器缓冲不受影响——打字必然与文档错位，F10 中断更会留下
+    一个被清空的文件。
     """
     from .modes import VSCodeMode, Target
 
     events = []
 
     class FakeExec:
+        def check_window(self):       return True
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def key_save(self):           events.append(("combo", "ctrl+s"))
@@ -1603,30 +1629,45 @@ def test_vscode_before_type_clears_document():
         def _sleep(self, s, active=True, chunk=0.25):
             events.append(("sleep", round(s, 3)))
 
-    m = VSCodeMode("proj", settings_paths=[], open_settle_s=0.6)
-    m.before_type(Target(path="sub/a.py", content="x"), FakeTyper())
+    with tempfile.TemporaryDirectory() as d:
+        tgt_file = os.path.join(d, "sub", "a.py")
+        os.makedirs(os.path.dirname(tgt_file), exist_ok=True)
+        with open(tgt_file, "w", encoding="utf-8") as f:
+            f.write("OLD CONTENT\n")
 
-    seq = [e for e in events if e[0] in ("combo", "key", "tap")]
-    assert seq[0] == ("combo", "ctrl+p"), f"必须先开 Quick Open: {seq}"
-    assert seq[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
-        f"结尾必须是 Ctrl+A + Delete 清空: {seq}"
-    assert ("tap", "enter") in seq, f"敲完路径要按 Enter: {seq}"
-    # Enter 必须在清空之前
-    i_enter = seq.index(("tap", "enter"))
-    i_clear = seq.index(("combo", "ctrl+a"))
-    assert i_enter < i_clear, f"先打开文件再清空: {seq}"
-    # 路径逐字符输入，且用的是相对 src_dir 的正斜杠路径
-    typed = "".join(c for kind, c in events if kind == "char")
-    assert typed == "sub/a.py", f"路径输入不对: {typed!r}"
-    assert ("log", "FILE/cleared") in events, "应记录清空动作以便审计"
+        m = VSCodeMode("proj", settings_paths=[], open_settle_s=0.6,
+                       locator="keyboard")
+        with fake_foreground_title("a.py — proj - Visual Studio Code"):
+            m.before_type(
+                Target(path="sub/a.py", content="x", abs_path=tgt_file),
+                FakeTyper())
 
-    # rel_prefix 存在时要带前缀（src_dir 不在工作区根目录的情形）
-    events.clear()
-    m2 = VSCodeMode("proj", settings_paths=[], open_settle_s=0.1,
-                    rel_prefix="myrepo")
-    m2.before_type(Target(path="a.py", content="x"), FakeTyper())
-    typed2 = "".join(c for kind, c in events if kind == "char")
-    assert typed2 == "myrepo/a.py", typed2
+        seq = [e for e in events if e[0] in ("combo", "key", "tap")]
+        assert seq[0] == ("combo", "ctrl+p"), f"必须先开 Quick Open: {seq}"
+        assert seq[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
+            f"结尾必须是 Ctrl+A + Delete 清空: {seq}"
+        assert ("tap", "enter") in seq, f"敲完路径要按 Enter: {seq}"
+        # Enter 必须在清空之前
+        i_enter = seq.index(("tap", "enter"))
+        i_clear = seq.index(("combo", "ctrl+a"))
+        assert i_enter < i_clear, f"先打开文件再清空: {seq}"
+        # 路径逐字符输入，且用的是相对 src_dir 的正斜杠路径
+        typed = "".join(c for kind, c in events if kind == "char")
+        assert typed == "sub/a.py", f"路径输入不对: {typed!r}"
+        assert ("log", "FILE/cleared") in events, "应记录清空动作以便审计"
+        # 关键回归：清空只发生在编辑器里，磁盘文件原封不动
+        with open(tgt_file, "r", encoding="utf-8") as f:
+            assert f.read() == "OLD CONTENT\n", \
+                "before_type 绝不能截断磁盘文件（F10 中断会丢内容）"
+
+        # rel_prefix 存在时要带前缀（src_dir 不在工作区根目录的情形）
+        events.clear()
+        m2 = VSCodeMode("proj", settings_paths=[], open_settle_s=0.1,
+                        locator="keyboard", rel_prefix="myrepo")
+        with fake_foreground_title("a.py — proj - Visual Studio Code"):
+            m2.before_type(Target(path="a.py", content="x"), FakeTyper())
+        typed2 = "".join(c for kind, c in events if kind == "char")
+        assert typed2 == "myrepo/a.py", typed2
 
     # dry-run 必须一发键都不发
     events.clear()
@@ -1637,6 +1678,71 @@ def test_vscode_before_type_clears_document():
     m3.before_type(Target(path="a.py", content="x"), DryTyper())
     assert events == [], f"dry-run 不该发键: {events}"
     print("PASS vscode_before_type_clears_document")
+
+
+def test_vscode_before_type_guard_blocks_on_wrong_window():
+    """回归：定位守卫失败时必须中止，零破坏性按键，磁盘原封不动。
+
+    这是"删错文件"的最终防线。定位器（CLI 返回码 / Quick Open 回车）
+    都不能证明活动编辑器是目标文件；守卫失败还继续发 Ctrl+A/Delete，
+    删掉的就是用户当前打开的那个文档（可能根本不在目标目录里）。
+    """
+    from .modes import VSCodeMode, Target
+
+    events = []
+
+    class FakeExec:
+        def check_window(self):       return True
+        def key_quick_open(self):     events.append(("combo", "ctrl+p"))
+        def key_select_all(self):     events.append(("combo", "ctrl+a"))
+        def delete_key(self):         events.append(("key", "delete"))
+        def type_char(self, ch, d=0.0, hold=None):
+            events.append(("char", ch))
+        def _tap_special(self, name, hold=None): events.append(("tap", name))
+
+    class FakeLogger:
+        def log(self, state, event, detail="", delay=0.0):
+            events.append(("log", f"{state}/{event}"))
+
+    class FakeKiller:
+        def killed(self): return False
+        def paused(self): return False
+
+    class FakeTyper:
+        cfg = type("C", (), {"dry_run": False})()
+        executor = FakeExec()
+        logger = FakeLogger()
+        kill = FakeKiller()
+
+        def _sleep(self, s, active=True, chunk=0.25): pass
+
+    with tempfile.TemporaryDirectory() as d:
+        tgt_file = os.path.join(d, "target.py")
+        with open(tgt_file, "w", encoding="utf-8") as f:
+            f.write("KEEP_ME\n")
+        m = VSCodeMode(d, settings_paths=[], locator="keyboard",
+                       open_settle_s=0.1)
+        t = Target(path="target.py", content="new", abs_path=tgt_file,
+                   meta={"source_path": os.path.join(d, "..", "src.py")})
+
+        raised = False
+        # 前台是另一个文档：Quick Open 打开了错的，或焦点压根不在 VS Code
+        with fake_foreground_title("other.py — proj - Visual Studio Code"):
+            try:
+                m.before_type(t, FakeTyper())
+            except RuntimeError as exc:
+                raised = True
+                assert "定位校验失败" in str(exc), str(exc)
+
+        assert raised, "守卫不通过时必须抛错，不能继续清空/打字"
+        with open(tgt_file, "r", encoding="utf-8") as f:
+            assert f.read() == "KEEP_ME\n", "守卫失败后磁盘必须原封不动"
+        sent = [e for e in events if e[0] in ("combo", "key", "tap")]
+        assert ("combo", "ctrl+a") not in sent, f"守卫失败不该发 Ctrl+A: {sent}"
+        assert ("key", "delete") not in sent, f"守卫失败不该发 Delete: {sent}"
+        assert ("log", "WINDOW/verify_failed") in events, \
+            "应记录校验失败原因以便排查"
+    print("PASS vscode_before_type_guard_blocks_on_wrong_window")
 
 
 def test_vscode_dry_run_does_not_fake_verification():
@@ -1695,6 +1801,7 @@ def test_vscode_source_path_never_cleared():
     events = []
 
     class FakeExec:
+        def check_window(self):       return True
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def key_save(self):           events.append(("combo", "ctrl+s"))
@@ -1716,7 +1823,9 @@ def test_vscode_source_path_never_cleared():
         m = VSCodeMode(d, target_dir=d, settings_paths=[])
         t = Target(path="important.py", content="important code\n",
                    abs_path=src_file, meta={"source_path": os.path.abspath(src_file)})
-        m.before_type(t, FakeTyper())
+        with fake_foreground_title(
+                f"important.py — {os.path.basename(d)} - Visual Studio Code"):
+            m.before_type(t, FakeTyper())
         assert ("combo", "ctrl+a") not in [e for e in events if e[0] == "combo"], \
             "源文件绝对不能被全选清空！"
         with open(src_file, "r", encoding="utf-8") as f:
@@ -1730,6 +1839,7 @@ def test_vscode_keyboard_rel_to_workspace():
     events = []
 
     class FakeExec:
+        def check_window(self):       return True
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def delete_key(self):         events.append(("key", "delete"))
@@ -1753,14 +1863,17 @@ def test_vscode_keyboard_rel_to_workspace():
                        settings_paths=[], locator="keyboard")
         t = Target(path="foo.py", content="new code\n", abs_path=tgt_file,
                    meta={"source_path": os.path.join(ws, "foo.py")})
-        m.before_type(t, FakeTyper())
+        with fake_foreground_title("foo.py — Demooo - Visual Studio Code"):
+            m.before_type(t, FakeTyper())
 
         typed = "".join(c for kind, c in events if kind == "char")
         assert typed == "Demooo/foo.py", f"Quick Open 应输入带工作区前缀的路径: {typed}"
+        # 清空必须发生在编辑器内：before_type 绝不能改动磁盘文件
         with open(tgt_file, "r", encoding="utf-8") as f:
-            assert f.read() == "", "目标文件应已安全清空"
+            assert f.read() == "old code\n", "before_type 不能改动磁盘文件"
         combos = [e for e in events if e[0] == "combo"]
-        assert ("combo", "ctrl+a") not in combos, "不应盲发物理 Ctrl+A 清空"
+        assert ("combo", "ctrl+a") in combos, "清空必须走编辑器内 Ctrl+A"
+        assert ("key", "delete") in events, "清空必须走编辑器内 Delete"
     print("PASS vscode_keyboard_rel_to_workspace")
 
 
@@ -1957,6 +2070,7 @@ def main():
     test_vscode_reread_matches_disk()
     test_vscode_strips_bom()
     test_vscode_before_type_clears_document()
+    test_vscode_before_type_guard_blocks_on_wrong_window()
     test_vscode_dry_run_does_not_fake_verification()
     test_vscode_iter_targets_skips_target_dir()
     test_vscode_source_path_never_cleared()
