@@ -220,33 +220,54 @@ class Executor:
             except Exception:
                 pass
 
+    @staticmethod
+    def _get_linux_foreground_window_title():
+        import subprocess
+        try:
+            res = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                check=False, capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0:
+                return res.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
+
     def check_window(self):
         """校验前台窗口标题。不匹配时**暂停**（而不是中止），匹配后自动恢复。
 
-        语义变更说明：以前这里失败就 kill.set()，等于"切走一次就彻底放弃"。
-        但真实的人只是暂停打字、切回来继续，所以现在失焦 = 暂停，
-        由 AutoTyper.run() 循环等待恢复；只有取不到窗口标题（非 Windows）
-        或压根没配 expected_window_title 时才走拒绝/跳过。
+        Windows 走 Win32 GetForegroundWindow；
+        Linux (X11) 走 xdotool getactivewindow getwindowname。
         """
         if not self.live or not self.cfg.expected_window_title:
             return True
-        if not sys.platform.startswith("win"):
+        title = ""
+        if sys.platform.startswith("win"):
+            import ctypes
+            try:
+                user32 = ctypes.windll.user32
+                hwnd = user32.GetForegroundWindow()
+                buf = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, buf, 512)
+                title = buf.value
+            except Exception as exc:      # 取不到标题就不该继续打字
+                self.log.log("WINDOW", "read_failed", repr(exc), 0)
+                title = ""
+        elif sys.platform.startswith("linux"):
+            t = self._get_linux_foreground_window_title()
+            if t is not None:
+                title = t
+            else:
+                if not getattr(self, "_warned_linux_win", False):
+                    self.log.log("WINDOW", "xdotool_missing", sys.platform, 0)
+                    print("WARNING: Linux 上未检测到 xdotool 或处于非 X11 环境，"
+                          "无法校验前台窗口标题；将跳过窗口标题校验。")
+                    self._warned_linux_win = True
+                return True
+        else:
             self.log.log("WINDOW", "unsupported_platform", sys.platform, 0)
-            print("WARNING: --window validation needs Windows; refusing to start "
-                  "because the foreground window cannot be verified.")
-            self.kill.set()
-            return False
-        import ctypes
-
-        try:
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetForegroundWindow()
-            buf = ctypes.create_unicode_buffer(512)
-            user32.GetWindowTextW(hwnd, buf, 512)
-            title = buf.value
-        except Exception as exc:      # 取不到标题就不该继续打字
-            self.log.log("WINDOW", "read_failed", repr(exc), 0)
-            title = ""
+            print(f"WARNING: --window validation not supported on {sys.platform}; skipping.")
+            return True
         ok = self.cfg.expected_window_title.lower() in title.lower()
         if ok:
             self.kill.request_resume()

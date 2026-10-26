@@ -20,7 +20,8 @@ from typing import Optional
 from .config import Config
 from .keymap import unsupported_chars
 from .machine import AutoTyper
-from .modes import (DEFAULT_EXTS, VSCODE_REQUIRED_SETTINGS, SingleFileMode,
+from .modes import (
+    get_mode,DEFAULT_EXTS, VSCODE_REQUIRED_SETTINGS, SingleFileMode,
                     VSCodeMode, collect_targets)
 from .presets import PRESETS, preset_names
 
@@ -57,8 +58,9 @@ LOG_FILE = os.path.join(BASE_DIR, "autotyper_log.csv")
 
 # 模式 -> 界面显示名。key 是 modes.py 里注册的模式名。
 MODE_LABELS = {"notepad": "单文件（任意编辑器）",
-               "vscode": "VSCode（目录多文件）"}
-MODE_ORDER = ["notepad", "vscode"]
+               "vscode": "VSCode（目录多文件）",
+               "vscode-linux": "VSCode（Linux 模式）"}
+MODE_ORDER = ["notepad", "vscode", "vscode-linux"]
 
 # --------------------------------------------------------------- 控件清单
 # unit: raw=原值, %=百分比(/100), ms=毫秒(/1000), min=分钟(*60)
@@ -531,7 +533,7 @@ class App(tk.Tk):
 
     def _on_mode_change(self, event=None):
         """切换模式。VSCode 模式下内容来自磁盘，「内容」页没意义，隐藏它。"""
-        if self.current_mode() == "vscode":
+        if self.current_mode() in ("vscode", "vscode-linux", "linux"):
             if not self.vs_panel.winfo_manager():
                 self.vs_panel.pack(fill="x", padx=8, pady=(6, 6))
             # 隐藏而不是禁用：禁用的控件会让人以为还能用。
@@ -595,7 +597,7 @@ class App(tk.Tk):
     def _start_impl(self):
         import random as _random
         cfg = self._collect_config()
-        if self.current_mode() == "vscode":
+        if self.current_mode() in ("vscode", "vscode-linux", "linux"):
             typer = self._make_vscode_typer(cfg, _random)
         else:
             typer = self._make_single_typer(cfg, _random)
@@ -609,7 +611,7 @@ class App(tk.Tk):
             orig_progress()
             # VSCode 模式的进度由 progress_hook 逐文件推送；这里只在单文件
             # 模式下更新字符级进度条（多文件时"当前文件内的百分比"会误导）。
-            if self.current_mode() != "vscode":
+            if self.current_mode() not in ("vscode", "vscode-linux", "linux"):
                 self.q.put(("pct", 100.0 * typer.pipeline.i
                             / max(1, len(typer.source))))
 
@@ -664,7 +666,8 @@ class App(tk.Tk):
             "Ctrl+P 快捷键（实验）": "keyboard",
         }.get(self.locator_var.get(), "auto")
         workspace_root = _find_workspace_root(target_dir)
-        mode = VSCodeMode(src_dir, source_dir=src_dir, target_dir=target_dir,
+        mode_cls = get_mode(self.current_mode())
+        mode = mode_cls(src_dir, source_dir=src_dir, target_dir=target_dir,
                           workspace_root=workspace_root, locator=locator,
                           require_cli=not cfg.dry_run,
                           max_files=self.max_files_var.get())

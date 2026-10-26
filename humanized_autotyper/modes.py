@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -201,6 +202,11 @@ def _ensure_file_exists(path: str) -> None:
         pass
 
 
+def _safe_escape(ex) -> None:
+    if hasattr(ex, "key_escape"):
+        ex.key_escape()
+
+
 
 class VSCodeMode(Mode):
     """把源目录中的多个文件逐个打进目标 VS Code 工作区。
@@ -262,7 +268,8 @@ class VSCodeMode(Mode):
 
     @staticmethod
     def _code_command() -> Optional[str]:
-        return shutil.which("code") or shutil.which("code.cmd")
+        return (shutil.which("code") or shutil.which("code.cmd") or
+                shutil.which("/snap/bin/code"))
 
     def resolved_locator(self) -> str:
         if self.locator != "auto":
@@ -305,6 +312,12 @@ class VSCodeMode(Mode):
         # Linux
         paths.append(os.path.join(home, ".config", "Code", "User",
                                   "settings.json"))
+        # Linux Snap
+        paths.append(os.path.join(home, "snap", "code", "current",
+                                  ".config", "Code", "User", "settings.json"))
+        # Linux Flatpak
+        paths.append(os.path.join(home, ".var", "app", "com.visualstudio.code",
+                                  "config", "Code", "User", "settings.json"))
         # 当前工作区（由调用方或 settings_for 解析为绝对路径）
         paths.append(".vscode/settings.json")
         return paths
@@ -331,11 +344,15 @@ class VSCodeMode(Mode):
         targets: List[Target] = []
         # 显式 followlinks=False：不跟随符号链接进入目录，防止循环链接
         # 导致无限递归或重复枚举。
+        target_root = os.path.normcase(os.path.abspath(self.target_dir))
+        source_root = os.path.normcase(os.path.abspath(self.source_dir))
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames[:] = sorted(
                 d for d in dirnames
                 if d not in SKIP_DIRS and not d.startswith(".")
-                and not d.lower().endswith(".egg-info"))
+                and not d.lower().endswith(".egg-info")
+                and not (target_root != source_root and
+                         os.path.normcase(os.path.abspath(os.path.join(dirpath, d))) == target_root))
             for fn in sorted(filenames):
                 if fn.startswith("."):
                     continue          # 隐藏文件（.env / .hidden.py）一律跳过
@@ -513,6 +530,11 @@ class VSCodeMode(Mode):
             "正确性以存盘后回读磁盘为准。",
             "建议在 git 仓库内运行，出问题可回滚。",
         ]
+        try:
+            if os.path.normcase(os.path.abspath(self.source_dir)) == os.path.normcase(os.path.abspath(self.target_dir)):
+                warnings.append("源文件夹与目标文件夹相同：为保护源码安全，打字机绝不会清空源文件。建议设置独立的 target_dir。")
+        except (ValueError, OSError):
+            pass
         if self.resolved_locator() == "keyboard":
             warnings.append(
                 "使用快捷键定位时，请确保 VS Code 窗口已打开且处于前台，"
@@ -545,7 +567,7 @@ class VSCodeMode(Mode):
 
         # 先发 Escape 确保 VS Code 处于干净状态（无残留 Quick Open、命令面板、
         # 建议框或通知弹窗），避免定位器在污染状态下操作。
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(0.1, active=False)
 
         # 无论首次还是重访，都重新定位到目标文件，确保 VS Code 当前活动编辑器
@@ -575,13 +597,29 @@ class VSCodeMode(Mode):
             return
         self._opened.add(target.path)
 
-        # 首次打开：如果文件是由 _ensure_file_exists 刚创建的空文件，
-        # 则无需执行危险的 Ctrl+A/Delete，直接开始打字即可。
-        # 这降低了"打开错误文件"极端场景下的数据丢失风险。
+        # 首次打开：防误删源文件与安全清空
+        source_path = target.meta.get("source_path")
+        is_source = False
+        if abs_path and source_path:
+            try:
+                is_source = (os.path.normcase(os.path.abspath(abs_path)) ==
+                             os.path.normcase(os.path.abspath(source_path)))
+            except (ValueError, OSError):
+                is_source = False
+
+        if is_source:
+            # 绝对不能清空源文件
+            typer.logger.log("FILE", "source_skip_clear", target.path, 0)
+            return
+
         is_empty = False
         if abs_path and os.path.exists(abs_path):
             try:
-                is_empty = os.path.getsize(abs_path) == 0
+                # 目标文件若有历史内容，先在磁盘层面安全截断，避免盲发键盘删除误伤活动窗口
+                if os.path.getsize(abs_path) > 0:
+                    with open(abs_path, "w", encoding="utf-8"):
+                        pass
+                is_empty = (os.path.getsize(abs_path) == 0)
             except OSError:
                 pass
 
@@ -617,7 +655,7 @@ class VSCodeMode(Mode):
         typer._sleep(settle, active=False)
         # 清除可能弹出的通知/欢迎页/对话框，确保后续操作不受阻碍。
         ex = typer.executor
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(0.2, active=False)
         typer.logger.log("FILE", "located_cli", target.path, 0)
 
@@ -626,11 +664,23 @@ class VSCodeMode(Mode):
         # 双重 Escape：彻底清除任何残留的 Quick Open、建议框、命令面板或
         # 多层嵌套模态 UI。单层 Escape 对嵌套场景（如命令面板内打开 Quick Open）
         # 可能不足，导致残留文本与新路径拼接而打开错误文件。
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(0.1, active=False)
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(self.open_settle_s / 2, active=False)
-        if self.rel_prefix:
+        if target.abs_path and self.workspace_root:
+            try:
+                norm_tgt = os.path.normcase(os.path.abspath(target.abs_path))
+                norm_ws = os.path.normcase(self.workspace_root)
+                if norm_tgt == norm_ws or norm_tgt.startswith(norm_ws + os.sep):
+                    quick_path = os.path.relpath(target.abs_path, self.workspace_root).replace("\\", "/")
+                elif self.rel_prefix:
+                    quick_path = f"{self.rel_prefix}/{target.path}"
+                else:
+                    quick_path = target.path
+            except (ValueError, OSError):
+                quick_path = f"{self.rel_prefix}/{target.path}" if self.rel_prefix else target.path
+        elif self.rel_prefix:
             # src_dir 不是工作区根目录时，Quick Open 需要带前缀
             quick_path = f"{self.rel_prefix}/{target.path}"
         else:
@@ -662,12 +712,12 @@ class VSCodeMode(Mode):
         ex = typer.executor
         # P0-12: 先 Escape 关闭可能存在的弹窗/通知/建议框，防止 Ctrl+S
         # 被对话框截获而导致保存失败。
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(0.1, active=False)
         ex.key_save()
         typer._sleep(self.save_settle_s, active=False)
         # 保存后关闭可能弹出的通知或确认框
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(0.1, active=False)
 
     def after_type(self, target: Target, typer) -> Dict[str, Any]:
@@ -682,12 +732,12 @@ class VSCodeMode(Mode):
             return {"ok": None, "verified": False,
                     "detail": "dry-run 未发键，未做磁盘校验"}
         # P0-12: 先 Escape 关闭可能阻塞的弹窗，确保 Ctrl+S 能直达编辑器
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(0.1, active=False)
         ex.key_save()
         typer._sleep(self.save_settle_s, active=False)
         # 保存后关闭可能弹出的通知
-        ex.key_escape()
+        _safe_escape(ex)
         typer._sleep(0.1, active=False)
         actual = self._read_back(target)
         if actual is None:
@@ -729,3 +779,78 @@ class VSCodeMode(Mode):
 
 
 register_mode(VSCodeMode)
+
+
+class VSCodeLinuxMode(VSCodeMode):
+    """VSCode Linux 专享模式：深度适配 Linux X11 环境、窗口聚焦与环境诊断。
+
+    解决三大问题：
+    1. 前台窗口失焦自动暂停 / 恢复由 executor 适配 xdotool；
+    2. preflight 增加 Wayland 环境检测与提示，避免全局监听与模拟击键受阻；
+    3. before_type 在定位文件后，通过 wmctrl/xdotool 强制激活置顶 VS Code，
+       解决 Linux 桌面焦点窃取防护导致的按键打偏。
+    """
+
+    name = "vscode-linux"
+    label = "VSCode (Linux 模式)"
+
+    def preflight(self, targets: List[Target]) -> List[str]:
+        errs = super().preflight(targets)
+        # 问题 2：Wayland 环境检测
+        xdg_session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        if xdg_session == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+            if self.require_cli:
+                errs.append(
+                    "环境检测未通过：当前桌面处于 Wayland 会话！\n"
+                    "Wayland 安全机制会拦截全局热键（F10 终止热键将失效）并阻止跨窗口模拟按键。\n"
+                    "请注销并在登录界面齿轮处切换为 'Ubuntu on Xorg' 或 'X11' 会话。")
+        return errs
+
+    def editor_warnings(self) -> List[str]:
+        warnings = super().editor_warnings()
+        warnings.append(
+            "Linux 模式提示：建议安装 xdotool 与 wmctrl (sudo apt install xdotool wmctrl)，"
+            "以支持窗口自动聚焦与前台失焦自动暂停。")
+        xdg_session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        if xdg_session == "wayland":
+            warnings.append(
+                "警告：当前环境为 Wayland 会话，模拟按键与 F10 终止可能受阻，建议在 X11 下运行。")
+        return warnings
+
+    def before_type(self, target: Target, typer) -> None:
+        super().before_type(target, typer)
+        # 问题 3：定位后强制激活并前置 VS Code 窗口
+        self._activate_window_linux(typer)
+
+    @staticmethod
+    def _activate_window_linux(typer) -> bool:
+        """在 Linux (X11) 下强制将 VS Code 窗口拉至前台并赋予输入焦点。"""
+        if not sys.platform.startswith("linux"):
+            return False
+        activated = False
+        if shutil.which("wmctrl"):
+            try:
+                res = subprocess.run(["wmctrl", "-x", "-a", "code"],
+                                     check=False, capture_output=True, timeout=2.0)
+                if res.returncode == 0:
+                    activated = True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not activated and shutil.which("xdotool"):
+            try:
+                res = subprocess.run(
+                    ["xdotool", "search", "--onlyvisible", "--class", "code", "windowactivate"],
+                    check=False, capture_output=True, timeout=2.0)
+                if res.returncode == 0:
+                    activated = True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if activated:
+            typer._sleep(0.3, active=False)
+            typer.logger.log("WINDOW", "activated_linux", "code", 0)
+            return True
+        return False
+
+
+register_mode(VSCodeLinuxMode)
+MODES["linux"] = VSCodeLinuxMode

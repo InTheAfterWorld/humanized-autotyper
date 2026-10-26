@@ -1668,6 +1668,184 @@ def test_vscode_dry_run_does_not_fake_verification():
     print("PASS vscode_dry_run_does_not_fake_verification")
 
 
+def test_vscode_iter_targets_skips_target_dir():
+    """回归：若 target_dir 在 source_dir 内部，枚举必须动态排除 target_dir，防止自引用污染。"""
+    from .modes import VSCodeMode
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "src")
+        tgt = os.path.join(src, "output_dir")
+        os.makedirs(tgt, exist_ok=True)
+        with open(os.path.join(src, "main.py"), "w", encoding="utf-8") as f:
+            f.write("print('main')\n")
+        with open(os.path.join(tgt, "out.py"), "w", encoding="utf-8") as f:
+            f.write("print('out')\n")
+
+        m = VSCodeMode(src, target_dir=tgt, settings_paths=[])
+        targets = m.iter_targets()
+        paths = [t.path for t in targets]
+        assert "main.py" in paths, f"应包含源文件: {paths}"
+        assert not any("output_dir" in p or "out.py" in p for p in paths), \
+            f"不应枚举目标目录内的文件: {paths}"
+    print("PASS vscode_iter_targets_skips_target_dir")
+
+
+def test_vscode_source_path_never_cleared():
+    """回归：若目标文件即源文件（相同路径），before_type 绝对不能清空源文件。"""
+    from .modes import VSCodeMode, Target
+    events = []
+
+    class FakeExec:
+        def key_quick_open(self):     events.append(("combo", "ctrl+p"))
+        def key_select_all(self):     events.append(("combo", "ctrl+a"))
+        def key_save(self):           events.append(("combo", "ctrl+s"))
+        def delete_key(self):         events.append(("key", "delete"))
+        def type_char(self, ch, d=0.0, hold=None): pass
+        def _tap_special(self, name, hold=None): pass
+
+    class FakeTyper:
+        cfg = type("C", (), {"dry_run": False})()
+        executor = FakeExec()
+        logger = type("L", (), {"log": lambda *a, **k: events.append(("log", f"{a[0]}/{a[1]}"))})()
+        def _sleep(self, s, active=True, chunk=0.25): pass
+
+    with tempfile.TemporaryDirectory() as d:
+        src_file = os.path.join(d, "important.py")
+        with open(src_file, "w", encoding="utf-8") as f:
+            f.write("important code\n")
+
+        m = VSCodeMode(d, target_dir=d, settings_paths=[])
+        t = Target(path="important.py", content="important code\n",
+                   abs_path=src_file, meta={"source_path": os.path.abspath(src_file)})
+        m.before_type(t, FakeTyper())
+        assert ("combo", "ctrl+a") not in [e for e in events if e[0] == "combo"], \
+            "源文件绝对不能被全选清空！"
+        with open(src_file, "r", encoding="utf-8") as f:
+            assert f.read() == "important code\n", "源文件内容必须完好无损"
+    print("PASS vscode_source_path_never_cleared")
+
+
+def test_vscode_keyboard_rel_to_workspace():
+    """回归：Quick Open 路径必须包含相对于 workspace_root 的工作区子目录前缀。"""
+    from .modes import VSCodeMode, Target
+    events = []
+
+    class FakeExec:
+        def key_quick_open(self):     events.append(("combo", "ctrl+p"))
+        def key_select_all(self):     events.append(("combo", "ctrl+a"))
+        def delete_key(self):         events.append(("key", "delete"))
+        def type_char(self, ch, d=0.0, hold=None): events.append(("char", ch))
+        def _tap_special(self, name, hold=None): events.append(("tap", name))
+
+    class FakeTyper:
+        cfg = type("C", (), {"dry_run": False})()
+        executor = FakeExec()
+        logger = type("L", (), {"log": lambda *a, **k: None})()
+        def _sleep(self, s, active=True, chunk=0.25): pass
+
+    with tempfile.TemporaryDirectory() as ws:
+        tgt_dir = os.path.join(ws, "Demooo")
+        os.makedirs(tgt_dir, exist_ok=True)
+        tgt_file = os.path.join(tgt_dir, "foo.py")
+        with open(tgt_file, "w", encoding="utf-8") as f:
+            f.write("old code\n")
+
+        m = VSCodeMode(ws, target_dir=tgt_dir, workspace_root=ws,
+                       settings_paths=[], locator="keyboard")
+        t = Target(path="foo.py", content="new code\n", abs_path=tgt_file,
+                   meta={"source_path": os.path.join(ws, "foo.py")})
+        m.before_type(t, FakeTyper())
+
+        typed = "".join(c for kind, c in events if kind == "char")
+        assert typed == "Demooo/foo.py", f"Quick Open 应输入带工作区前缀的路径: {typed}"
+        with open(tgt_file, "r", encoding="utf-8") as f:
+            assert f.read() == "", "目标文件应已安全清空"
+        combos = [e for e in events if e[0] == "combo"]
+        assert ("combo", "ctrl+a") not in combos, "不应盲发物理 Ctrl+A 清空"
+    print("PASS vscode_keyboard_rel_to_workspace")
+
+
+def test_vscode_linux_mode_preflight_wayland():
+    """回归：VSCodeLinuxMode 在 Wayland 会话 + require_cli 时 preflight 应阻断。"""
+    from .modes import VSCodeLinuxMode
+    import unittest.mock as mock
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "src")
+        os.makedirs(src, exist_ok=True)
+        with open(os.path.join(src, "hello.py"), "w", encoding="utf-8") as f:
+            f.write("print('hi')\n")
+
+        # require_cli=True + Wayland 环境 → 应包含 Wayland 阻断错误
+        m = VSCodeLinuxMode(src, settings_paths=[], require_cli=True)
+        targets = m.iter_targets()
+
+        # 模拟 XDG_SESSION_TYPE=wayland
+        env_patch = {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": ""}
+        with mock.patch.dict(os.environ, env_patch, clear=False):
+            errs = m.preflight(targets)
+        wayland_errs = [e for e in errs if "Wayland" in e]
+        assert wayland_errs, f"应有 Wayland 阻断错误，实际: {errs}"
+
+        # 非 Wayland 环境 → 不应包含 Wayland 阻断错误
+        env_patch2 = {"XDG_SESSION_TYPE": "x11"}
+        with mock.patch.dict(os.environ, env_patch2, clear=False):
+            # 先移除 WAYLAND_DISPLAY 以免干扰
+            with mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": ""}, clear=False):
+                os.environ.pop("WAYLAND_DISPLAY", None)
+                errs2 = m.preflight(targets)
+        wayland_errs2 = [e for e in errs2 if "Wayland" in e]
+        assert not wayland_errs2, f"X11 下不应有 Wayland 错误，实际: {errs2}"
+    print("PASS vscode_linux_mode_preflight_wayland")
+
+
+def test_vscode_linux_mode_activate_window():
+    """回归：VSCodeLinuxMode._activate_window_linux 在非 Linux 上直接返回 False。"""
+    from .modes import VSCodeLinuxMode
+
+    class FakeTyper:
+        cfg = type("C", (), {"dry_run": False})()
+        logger = type("L", (), {"log": lambda *a, **k: None})()
+        def _sleep(self, s, active=True, chunk=0.25): pass
+
+    # 当前测试在 Windows 上跑，_activate_window_linux 应短路返回 False
+    result = VSCodeLinuxMode._activate_window_linux(FakeTyper())
+    assert result is False, f"非 Linux 平台应返回 False，实际: {result}"
+    print("PASS vscode_linux_mode_activate_window")
+
+
+def test_check_window_linux_fallback():
+    """回归：check_window 在 Linux 下使用 xdotool，无工具时优雅降级跳过。"""
+    import unittest.mock as mock
+    from .executor import Executor, Killer, Logger
+
+    cfg = fast_cfg(dry_run=False)
+    cfg.expected_window_title = "Visual Studio Code"
+    ex = Executor(cfg, DelayModel(cfg, random.Random(1)), Logger(cfg), Killer())
+
+    # 模拟 Linux 平台，xdotool 返回匹配标题 → 应继续
+    with mock.patch("sys.platform", "linux"):
+        with mock.patch.object(Executor, "_get_linux_foreground_window_title",
+                               return_value="main.py - Visual Studio Code"):
+            result = ex.check_window()
+            assert result is True, f"标题匹配应返回 True: {result}"
+
+    # 模拟 Linux 平台，xdotool 返回不匹配标题 → 应暂停
+    with mock.patch("sys.platform", "linux"):
+        with mock.patch.object(Executor, "_get_linux_foreground_window_title",
+                               return_value="Firefox"):
+            result = ex.check_window()
+            assert result is False, f"标题不匹配应返回 False: {result}"
+
+    # 模拟 Linux 平台，xdotool 不可用 → 应优雅降级（返回 True 跳过）
+    with mock.patch("sys.platform", "linux"):
+        with mock.patch.object(Executor, "_get_linux_foreground_window_title",
+                               return_value=None):
+            ex._warned_linux_win = False  # 重置警告标志
+            result = ex.check_window()
+            assert result is True, f"xdotool 不可用应降级跳过: {result}"
+    print("PASS check_window_linux_fallback")
+
+
 def s_files_ok_ignores_unverified():
     """files_ok 只数 ok is True；ok=None（未校验）不得混入成功数。"""
     per_file = [{"ok": True}, {"ok": None}, {"ok": False}]
@@ -1780,6 +1958,12 @@ def main():
     test_vscode_strips_bom()
     test_vscode_before_type_clears_document()
     test_vscode_dry_run_does_not_fake_verification()
+    test_vscode_iter_targets_skips_target_dir()
+    test_vscode_source_path_never_cleared()
+    test_vscode_keyboard_rel_to_workspace()
+    test_vscode_linux_mode_preflight_wayland()
+    test_vscode_linux_mode_activate_window()
+    test_check_window_linux_fallback()
     print("ALL SANITY CHECKS PASSED")
 
 

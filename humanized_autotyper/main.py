@@ -131,9 +131,10 @@ def _build_mode(args):
     早先这里返回 SingleFileMode(None) 当占位，那是个类型谎言：source 是
     str，传 None 既不合法也毫无意义（该对象马上就要被 main() 覆盖掉）。
     """
-    if args.mode == "vscode":
+    if args.mode in ("vscode", "vscode-linux", "linux"):
+        cls = get_mode(args.mode)
         exts = [e.strip() for e in args.ext.split(",") if e.strip()]
-        mode = VSCodeMode(
+        mode = cls(
             args.source_dir, exts=exts,
             source_dir=args.source_dir,
             target_dir=args.target_dir or args.source_dir,
