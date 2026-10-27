@@ -141,6 +141,7 @@ def _build_mode(args):
             workspace_root=(args.workspace_root or
                             args.target_dir or args.source_dir),
             locator=args.locator, require_cli=args.live,
+            require_window_check=args.live,
             max_files=args.max_files)
         try:
             targets = collect_targets(mode)

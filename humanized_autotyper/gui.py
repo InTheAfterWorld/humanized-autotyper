@@ -670,6 +670,7 @@ class App(tk.Tk):
         mode = mode_cls(src_dir, source_dir=src_dir, target_dir=target_dir,
                           workspace_root=workspace_root, locator=locator,
                           require_cli=not cfg.dry_run,
+                          require_window_check=not cfg.dry_run,
                           max_files=self.max_files_var.get())
         # 枚举 + 读取全部目标文件是同步的；大目录要几秒。先把状态画出来，
         # 否则用户只看到窗口无响应，以为卡在"定位文件"。

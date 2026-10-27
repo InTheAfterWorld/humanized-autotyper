@@ -187,7 +187,7 @@ def _ensure_file_exists(path: str) -> None:
 
     VSCode 的 Quick Open 只能打开**已经存在于工作区**的文件：文件若从未
     创建/保存过，Quick Open 找不到它，Enter 也不会打开任何东西，后续的
-    Ctrl+A/Delete 会作用在错误的文档上，整轮看起来就像“卡住”了。这里在
+    定位与打字会作用在错误的文档上，整轮看起来就像“卡住”了。这里在
     真正发键前把空文件建好（父目录一并创建），让 Quick Open 能定位到它；
     真正的内容随后由打字过程写入并 Ctrl+S 落盘。
     """
@@ -212,9 +212,9 @@ def _foreground_window_title() -> Optional[str]:
 
     Windows 走 Win32 GetForegroundWindow + GetWindowTextW（与
     executor.check_window 同款取法）；Linux 走 xdotool。返回 None 表示
-    "无法校验"（平台不支持 / 工具缺失 / 读取失败），调用方应据此放行，
-    而不是把它当成"校验失败"——否则 macOS 与无 xdotool 的 Linux 上
-    每个文件都会被拒。
+    "无法校验"（平台不支持 / 工具缺失 / 读取失败）。这个结果的含义取决于
+    调用方：dry-run 可以放行；**真实输入必须拒绝**——盲发按键给一个未知
+    焦点的窗口，字符会直接打进那个窗口。
     """
     if sys.platform.startswith("win"):
         import ctypes
@@ -257,6 +257,7 @@ class VSCodeMode(Mode):
                  workspace_root: Optional[str] = None,
                  locator: str = "auto",
                  require_cli: bool = False,
+                 require_window_check: bool = False,
                  settings_paths=None, max_files: int = 0,
                  open_settle_s: float = 0.6, save_settle_s: float = 0.8):
         # src_dir remains as a compatibility alias for callers from 1.x.
@@ -273,6 +274,9 @@ class VSCodeMode(Mode):
             workspace_root or default_workspace)
         self.locator = locator.lower().strip()
         self.require_cli = require_cli
+        # True = 真实输入（GUI 的"开始真实输入" / CLI 的 --live）。定位守卫
+        # 依赖前台窗口标题，读不到就必须拒绝启动，而不是放行后盲发按键。
+        self.require_window_check = require_window_check
         if self.locator not in ("auto", "cli", "keyboard"):
             raise ValueError("locator must be one of: auto, cli, keyboard")
         self.exts = tuple(e if e.startswith(".") else "." + e
@@ -528,6 +532,23 @@ class VSCodeMode(Mode):
         if not targets:
             errs.append(f"在 {self.source_dir} 下没找到任何匹配 "
                         f"{'/'.join(self.exts)} 的文件")
+        # 定位守卫的前提是能读到前台窗口标题。读不到就拒绝真实输入：
+        # 按键会落到未知焦点的窗口上——在文件管理器里，输入的字符会变成
+        # 搜索、Enter 会打开选中的文件。
+        if self.require_window_check:
+            if sys.platform.startswith("linux") and not shutil.which("xdotool"):
+                errs.append(
+                    "Linux 上无法读取前台窗口标题（定位守卫需要 xdotool），"
+                    "已阻止真实输入以免误删文件。安装：sudo apt install xdotool")
+            elif sys.platform == "darwin":
+                errs.append(
+                    "macOS 上无法读取前台窗口标题，VSCode 真实输入无法验证"
+                    "活动文档，已阻止以免误删文件。")
+            elif not (sys.platform.startswith("win")
+                      or sys.platform.startswith("linux")):
+                errs.append(
+                    f"当前平台 {sys.platform} 不支持前台窗口校验，"
+                    "VSCode 真实输入已阻止以免误删文件。")
         for t in targets:
             if t.meta.get("error"):
                 errs.append(f"{t.path}: 读取失败 {t.meta['error']}")
@@ -576,16 +597,17 @@ class VSCodeMode(Mode):
 
     # ------------------------------------------------------ 定位 / 存盘 / 校验
     def before_type(self, target: Target, typer) -> None:
-        """Ctrl+P 打开目标文件，然后把文档清空到起始状态。
+        """把编辑器定位到目标文件，为打字做好准备。
 
-        清空这一步不可省：Quick Open 只是**切换**到已打开的标签页，光标还停在
-        上次的位置、文档里也留着上次的内容。而 `AutoTyper` 每个文件都从空的
-        `Buffer("")` 起步（见 machine._reset_for_target），不清空的话打出来的
-        文本会插到旧内容中间，缓冲区与文档从此错位，且回读校验只会报一个
-        语焉不详的"长度不同"。
+        这里**不做任何清空**。`Ctrl+A` + `Delete` 已整组移除：焦点落到文件
+        管理器时，它们在 Linux 桌面上就是"全选 → 删除文件"，一次清空整个
+        目录——这个代价远高于"重跑时多出一段旧内容"。
 
-        全程只依赖 Ctrl+A / Delete 两个按键，不依赖光标当前位置——这比"移动到
-        文末再逐行删"可靠得多（后者在文件很大时要发上千次按键）。
+        目标文件由 `_ensure_file_exists` 创建为空，干净目录下不需要清空。
+        重跑有旧内容的文件时，新文本插在旧内容之前，回读校验会报长度不符
+        并标 FAIL——但磁盘上不会丢任何东西。
+
+        定位只依赖 `Ctrl+P`（或 CLI）；清空相关的按键一个都不发。
         """
         ex = typer.executor
         if getattr(typer.cfg, "dry_run", True):
@@ -594,6 +616,20 @@ class VSCodeMode(Mode):
         abs_path = target.abs_path
         if abs_path is not None:
             _ensure_file_exists(abs_path)
+
+        # pynput 的按键注入发给**当前焦点窗口**，不是"目标窗口"。定位用的
+        # Ctrl+P、路径字符以及随后的打字，只有落在 VS Code 里才有意义。
+        # 所以 Linux 上必须在发出第一个按键之前先把 VS Code 拉到前台。
+        # 非 Linux 直接返回 False。
+        self._activate_window_linux(typer)
+
+        # 真实输入的前置条件：守卫必须读得到前台窗口标题。读不到就一个键
+        # 都不发——连 Escape / Ctrl+P 也不发，因为它们同样会落到未知焦点的
+        # 窗口上（Ctrl+P 在浏览器是打印，在编辑器是 Quick Open……）。
+        if self.require_window_check and _foreground_window_title() is None:
+            raise RuntimeError(
+                "无法读取前台窗口标题，无法确认 VS Code 活动文档；已中止以免"
+                "按键发到错误窗口（Linux 请安装 xdotool：sudo apt install xdotool）")
 
         # 先发 Escape 确保 VS Code 处于干净状态（无残留 Quick Open、命令面板、
         # 建议框或通知弹窗），避免定位器在污染状态下操作。
@@ -619,8 +655,8 @@ class VSCodeMode(Mode):
             self._open_with_keyboard(target, typer)
 
         # 定位守卫：定位器成功只代表"尝试过"，不代表此刻活动编辑器就是目标
-        # 文件。后续的 Ctrl+A / Delete / 打字全部作用在**活动文档**上——定位
-        # 错了就是删错、打错、存错。必须在任何破坏性按键之前确认。
+        # 文件。后续的路径字符、打字、存盘全部作用在**活动文档**上——定位
+        # 错了就是打错、存错。必须在发出第一个按键之前确认。
         if not self._verify_target_window(target, typer):
             raise RuntimeError(
                 f"定位校验失败：VS Code 活动编辑器不是 {target.path}"
@@ -651,31 +687,65 @@ class VSCodeMode(Mode):
             typer.logger.log("FILE", "source_skip_clear", target.path, 0)
             return
 
-        # 清空只在编辑器内完成（README 的原始设计）：定位守卫已确认活动
-        # 编辑器就是目标文件，所以 Ctrl+A + Delete 清掉的是它的旧内容。
+        # 不做任何清空。Ctrl+A 在 Linux 桌面环境下可能落到文件管理器上，
+        # 直接变成"全选 → 删除文件"，所以这一组按键整体移除。
         #
-        # 绝不在磁盘层面预先截断目标文件。那会在定位尚未验证时先毁掉磁盘
-        # 内容，而编辑器的内存缓冲不受影响——磁盘已空、文档仍是旧内容，打字
-        # 插进旧内容中间，Ctrl+S 把"旧+新"混写回去，回读必然不符；F10 中断
-        # 时更会留下一个被清空的文件（目标目录里所有文件都会这样被"删掉"）。
-        ex.key_select_all()
-        typer._sleep(self.open_settle_s / 2, active=False)
-        ex.delete_key()
-        typer._sleep(self.open_settle_s / 2, active=False)
-        typer.logger.log("FILE", "cleared", target.path, 0)
+        # 目标文件由 _ensure_file_exists 创建为空，干净目录下本来就没有内容
+        # 需要清；重跑有旧内容的文件时，新文本会插在旧内容之前，回读校验
+        # 会把它标成 FAIL——但磁盘上不会丢任何东西，这比误删整个目录可接受。
+        #
+        # 绝不在磁盘层面截断目标文件：那会在定位尚未验证时先毁掉磁盘内容，
+        # 而编辑器的内存缓冲不受影响，磁盘与文档就此脱节；F10 中断时更会
+        # 留下一个被清空的文件。
+        typer.logger.log("FILE", "no_clear", target.path, 0)
+
+    @staticmethod
+    def _activate_window_linux(typer) -> bool:
+        """在 Linux (X11) 下强制将 VS Code 窗口拉至前台并赋予输入焦点。
+
+        pynput 的按键注入发给**当前有焦点的窗口**：焦点在文件管理器时，
+        输入的字符会变成搜索、Enter 会打开选中的文件。所以 Linux 上必须在
+        发任何按键（包括定位用的 Ctrl+P）之前先把 VS Code 拉到前台。
+        """
+        if not sys.platform.startswith("linux"):
+            return False
+        activated = False
+        if shutil.which("wmctrl"):
+            try:
+                res = subprocess.run(["wmctrl", "-x", "-a", "code"],
+                                     check=False, capture_output=True,
+                                     timeout=2.0)
+                if res.returncode == 0:
+                    activated = True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not activated and shutil.which("xdotool"):
+            try:
+                res = subprocess.run(
+                    ["xdotool", "search", "--onlyvisible", "--class", "code",
+                     "windowactivate"],
+                    check=False, capture_output=True, timeout=2.0)
+                if res.returncode == 0:
+                    activated = True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if activated:
+            typer._sleep(0.3, active=False)
+            typer.logger.log("WINDOW", "activated_linux", "code", 0)
+            return True
+        return False
 
     def _verify_target_window(self, target: Target, typer) -> bool:
         """定位守卫：确认 VS Code 在前台、且活动编辑器就是目标文件。
 
         定位器（code --goto / Quick Open）只负责"尝试打开"：CLI 的返回码
         几乎恒定为 0，Quick Open 的 Enter 也可能打开模糊匹配到的其它文件。
-        而后续的 Ctrl+A / Delete / 打字作用于**当前活动文档**，所以这里是
-        唯一能在破坏性动作之前拦住"删错文件"的地方。
+        而后续的路径字符与打字作用于**当前活动文档**，所以这里是唯一能在
+        按键发出之前拦住"打到错误文件"的地方。
 
         - 焦点：复用 check_window 的暂停语义；不匹配就等用户切回。
         - 文档：VS Code 窗口标题含目标文件名与工作区/目标目录名。
-        - 取不到标题（macOS / 无 xdotool 的 Linux）：只记日志不阻断，
-          与 executor.check_window 的既有策略保持一致。
+        - 取不到标题：dry-run 放行；真实输入判失败（见下方注释）。
         """
         ex = typer.executor
         if not ex.check_window():
@@ -690,8 +760,12 @@ class VSCodeMode(Mode):
                 return False
         title = _foreground_window_title()
         if title is None:
+            # 读不到标题时历史行为是放行（与 executor.check_window 一致），
+            # 但那等于**没有守卫**：路径字符和打字照样发给当前焦点窗口。
+            # 真实输入（require_window_check）必须把"无法校验"当成校验失败，
+            # 宁可不打字，也不要把内容打进未知窗口。
             typer.logger.log("WINDOW", "verify_unavailable", target.path, 0)
-            return True
+            return not self.require_window_check
         folded = title.casefold()
         want_file = os.path.basename(
             target.path.replace("/", os.sep)).casefold()
@@ -875,10 +949,13 @@ class VSCodeLinuxMode(VSCodeMode):
 
     def preflight(self, targets: List[Target]) -> List[str]:
         errs = super().preflight(targets)
-        # 问题 2：Wayland 环境检测
+        # 问题 2：Wayland 环境检测。真实输入同样要拦：Wayland 下 pynput 的
+        # XTEST 注入不可靠，wmctrl/xdotool 也拿不到原生窗口的焦点，等于
+        # 把按键交给无法控制的焦点。原条件只看 require_cli，结果普通
+        # --mode vscode-linux 在 Wayland 上照样盲发按键。
         xdg_session = os.environ.get("XDG_SESSION_TYPE", "").lower()
         if xdg_session == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
-            if self.require_cli:
+            if self.require_window_check or self.require_cli:
                 errs.append(
                     "环境检测未通过：当前桌面处于 Wayland 会话！\n"
                     "Wayland 安全机制会拦截全局热键（F10 终止热键将失效）并阻止跨窗口模拟按键。\n"
@@ -897,41 +974,10 @@ class VSCodeLinuxMode(VSCodeMode):
         return warnings
 
     def before_type(self, target: Target, typer) -> None:
-        # 守卫依据前台窗口标题判定活动文档，所以必须先激活再走基类；
-        # 否则窗口还在后台时守卫必然失败，每个文件都会被判定位失败。
-        self._activate_window_linux(typer)
+        # 基类 before_type 开头已经激活过一次（守卫必须在窗口前台时才读得到
+        # 标题）；这里只补收尾的一次：CLI 定位/清空后桌面环境可能把焦点抢走。
         super().before_type(target, typer)
-        # CLI 定位/清空后桌面环境可能把焦点抢走，收尾再拉回一次。
         self._activate_window_linux(typer)
-
-    @staticmethod
-    def _activate_window_linux(typer) -> bool:
-        """在 Linux (X11) 下强制将 VS Code 窗口拉至前台并赋予输入焦点。"""
-        if not sys.platform.startswith("linux"):
-            return False
-        activated = False
-        if shutil.which("wmctrl"):
-            try:
-                res = subprocess.run(["wmctrl", "-x", "-a", "code"],
-                                     check=False, capture_output=True, timeout=2.0)
-                if res.returncode == 0:
-                    activated = True
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        if not activated and shutil.which("xdotool"):
-            try:
-                res = subprocess.run(
-                    ["xdotool", "search", "--onlyvisible", "--class", "code", "windowactivate"],
-                    check=False, capture_output=True, timeout=2.0)
-                if res.returncode == 0:
-                    activated = True
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        if activated:
-            typer._sleep(0.3, active=False)
-            typer.logger.log("WINDOW", "activated_linux", "code", 0)
-            return True
-        return False
 
 
 register_mode(VSCodeLinuxMode)

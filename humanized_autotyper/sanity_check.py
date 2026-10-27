@@ -1161,10 +1161,13 @@ def test_file_switch_disabled_is_sequential():
 
 
 def test_vscode_before_type_resume_keeps_content():
-    """交替打字重访：第二次 before_type 绝不能清空文档，只把光标压到文末。
+    """交替打字重访：before_type 从不发清空按键，重访只把光标压到文末。
 
-    锁定按键序列：首次 = Ctrl+P → 路径 → Enter → Ctrl+A → Delete；
-    重访 = Ctrl+P → 路径 → Enter → Ctrl+End（无 Ctrl+A / Delete）。
+    锁定按键序列：首次 = Ctrl+P → 路径 → Enter（无 Ctrl+A / Delete）；
+    重访 = Ctrl+P → 路径 → Enter → Ctrl+End。
+
+    Ctrl+A + Delete 整组移除：焦点落到文件管理器时，这两个键在 Linux
+    桌面上就是"全选 → 删除文件"，一次清空整个目录。
     """
     from .modes import VSCodeMode, Target
 
@@ -1197,14 +1200,15 @@ def test_vscode_before_type_resume_keeps_content():
     m = VSCodeMode("proj", settings_paths=[], open_settle_s=0.1)
     tgt = Target(path="a.py", content="hello")
 
-    # 首次：清空
+    # 首次：定位后直接进入打字，不发任何清空按键
     with fake_foreground_title("a.py — proj - Visual Studio Code"):
         m.before_type(tgt, FakeTyper())
     seq1 = [e for e in events if e[0] in ("combo", "key", "tap")]
-    assert seq1[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
-        f"首次结尾必须 Ctrl+A + Delete: {seq1}"
+    assert ("combo", "ctrl+a") not in seq1, f"不该发 Ctrl+A: {seq1}"
+    assert ("key", "delete") not in seq1, f"不该发 Delete: {seq1}"
+    assert ("log", "FILE/no_clear") in events, "应记录未清空以便审计"
 
-    # 重访：不清空，改为 Ctrl+End
+    # 重访：只压到文末，同样不发清空按键
     events.clear()
     with fake_foreground_title("a.py — proj - Visual Studio Code"):
         m.before_type(tgt, FakeTyper())
@@ -1589,18 +1593,17 @@ def test_vscode_strips_bom():
     print("PASS vscode_strips_bom")
 
 
-def test_vscode_before_type_clears_document():
-    """回归：打开文件后必须清空文档，但清空只能发生在编辑器内。
+def test_vscode_before_type_sends_no_clear_keys():
+    """回归：before_type 绝不发送清空按键，也绝不修改磁盘文件。
 
-    Quick Open 只是**切换**标签页，文档里还留着上次的内容；而每个文件的
-    Buffer 是从空的起步的。不清空就会把新文本插到旧内容中间。
+    清空原本是 Ctrl+A（全选）+ Delete 一组动作。这两个键发给错误的焦点
+    窗口时，在 Linux 桌面上就是"全选 → 删除文件"，一次清空整个目录。
+    因此整组按键移除：目标文件由 _ensure_file_exists 创建为空，干净目录
+    下本来就没有内容需要清。
 
-    这里锁定按下的**顺序**必须完整且正确：
-    Ctrl+P -> 路径 -> Enter -> Ctrl+A -> Delete
-
-    同时锁定：before_type **不得修改磁盘文件**。磁盘截断会先毁掉目标
-    内容，而编辑器缓冲不受影响——打字必然与文档错位，F10 中断更会留下
-    一个被清空的文件。
+    这里锁定两件事：
+    1. 按键序列只有 Ctrl+P -> 路径 -> Enter，没有 Ctrl+A / Delete；
+    2. before_type 前后磁盘字节完全不变（F10 中断不会丢内容）。
     """
     from .modes import VSCodeMode, Target
 
@@ -1644,21 +1647,17 @@ def test_vscode_before_type_clears_document():
 
         seq = [e for e in events if e[0] in ("combo", "key", "tap")]
         assert seq[0] == ("combo", "ctrl+p"), f"必须先开 Quick Open: {seq}"
-        assert seq[-2:] == [("combo", "ctrl+a"), ("key", "delete")], \
-            f"结尾必须是 Ctrl+A + Delete 清空: {seq}"
+        assert ("combo", "ctrl+a") not in seq, f"不该发 Ctrl+A: {seq}"
+        assert ("key", "delete") not in seq, f"不该发 Delete: {seq}"
         assert ("tap", "enter") in seq, f"敲完路径要按 Enter: {seq}"
-        # Enter 必须在清空之前
-        i_enter = seq.index(("tap", "enter"))
-        i_clear = seq.index(("combo", "ctrl+a"))
-        assert i_enter < i_clear, f"先打开文件再清空: {seq}"
         # 路径逐字符输入，且用的是相对 src_dir 的正斜杠路径
         typed = "".join(c for kind, c in events if kind == "char")
         assert typed == "sub/a.py", f"路径输入不对: {typed!r}"
-        assert ("log", "FILE/cleared") in events, "应记录清空动作以便审计"
-        # 关键回归：清空只发生在编辑器里，磁盘文件原封不动
+        assert ("log", "FILE/no_clear") in events, "应记录未清空以便审计"
+        # 关键回归：整个过程磁盘文件原封不动
         with open(tgt_file, "r", encoding="utf-8") as f:
             assert f.read() == "OLD CONTENT\n", \
-                "before_type 绝不能截断磁盘文件（F10 中断会丢内容）"
+                "before_type 绝不能修改磁盘文件（F10 中断会丢内容）"
 
         # rel_prefix 存在时要带前缀（src_dir 不在工作区根目录的情形）
         events.clear()
@@ -1868,12 +1867,13 @@ def test_vscode_keyboard_rel_to_workspace():
 
         typed = "".join(c for kind, c in events if kind == "char")
         assert typed == "Demooo/foo.py", f"Quick Open 应输入带工作区前缀的路径: {typed}"
-        # 清空必须发生在编辑器内：before_type 绝不能改动磁盘文件
+        # 不做任何清空：before_type 既不改磁盘，也不发 Ctrl+A / Delete
         with open(tgt_file, "r", encoding="utf-8") as f:
             assert f.read() == "old code\n", "before_type 不能改动磁盘文件"
         combos = [e for e in events if e[0] == "combo"]
-        assert ("combo", "ctrl+a") in combos, "清空必须走编辑器内 Ctrl+A"
-        assert ("key", "delete") in events, "清空必须走编辑器内 Delete"
+        assert ("combo", "ctrl+a") not in combos, \
+            "不该发 Ctrl+A（焦点在文件管理器时就是全选）"
+        assert ("key", "delete") not in events, "不该发 Delete"
     print("PASS vscode_keyboard_rel_to_workspace")
 
 
@@ -2069,7 +2069,7 @@ def main():
     test_vscode_verify_reports_diff()
     test_vscode_reread_matches_disk()
     test_vscode_strips_bom()
-    test_vscode_before_type_clears_document()
+    test_vscode_before_type_sends_no_clear_keys()
     test_vscode_before_type_guard_blocks_on_wrong_window()
     test_vscode_dry_run_does_not_fake_verification()
     test_vscode_iter_targets_skips_target_dir()
