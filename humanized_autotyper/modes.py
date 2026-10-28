@@ -532,6 +532,19 @@ class VSCodeMode(Mode):
         if not targets:
             errs.append(f"在 {self.source_dir} 下没找到任何匹配 "
                         f"{'/'.join(self.exts)} 的文件")
+        # 目标文件非空 = 上一次运行的残留（或用户预置的内容）。当前不清空
+        # 文档，往里打字只会得到"新内容 + 旧内容"，回读必然 FAIL。启动前
+        # 拦住，比打到一半再报"长度不同"清楚得多，也不会写坏任何文件。
+        stale = [t for t in targets
+                 if t.abs_path and os.path.isfile(t.abs_path)
+                 and os.path.getsize(t.abs_path) > 0]
+        if stale:
+            shown = ", ".join(t.path for t in stale[:5])
+            extra = f" 等 {len(stale)} 个" if len(stale) > 5 else ""
+            errs.append(
+                f"目标目录里有 {len(stale)} 个文件已存在且非空：{shown}{extra}。"
+                "程序不清空文档，往里打字会得到「新内容 + 旧内容」。"
+                "请清空或更换目标目录后重试。")
         # 定位守卫的前提是能读到前台窗口标题。读不到就拒绝真实输入：
         # 按键会落到未知焦点的窗口上——在文件管理器里，输入的字符会变成
         # 搜索、Enter 会打开选中的文件。
@@ -697,6 +710,12 @@ class VSCodeMode(Mode):
         # 绝不在磁盘层面截断目标文件：那会在定位尚未验证时先毁掉磁盘内容，
         # 而编辑器的内存缓冲不受影响，磁盘与文档就此脱节；F10 中断时更会
         # 留下一个被清空的文件。
+        # 光标归零：VS Code 会为每个文件记住上次的光标位置，`--goto` 与
+        # Quick Open 都会把它恢复回来。不复位就会把新文本插到旧内容中间，
+        # 缓冲区与文档从此错位。空文档上这一下无副作用。
+        ex.key_doc_start()
+        typer._sleep(self.open_settle_s / 2, active=False)
+
         typer.logger.log("FILE", "no_clear", target.path, 0)
 
     @staticmethod

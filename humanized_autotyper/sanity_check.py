@@ -1175,6 +1175,7 @@ def test_vscode_before_type_resume_keeps_content():
 
     class FakeExec:
         def check_window(self):       return True
+        def key_doc_start(self):      events.append(("combo", "ctrl+home"))
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def key_save(self):           events.append(("combo", "ctrl+s"))
@@ -1611,6 +1612,7 @@ def test_vscode_before_type_sends_no_clear_keys():
 
     class FakeExec:
         def check_window(self):       return True
+        def key_doc_start(self):      events.append(("combo", "ctrl+home"))
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def key_save(self):           events.append(("combo", "ctrl+s"))
@@ -1692,6 +1694,7 @@ def test_vscode_before_type_guard_blocks_on_wrong_window():
 
     class FakeExec:
         def check_window(self):       return True
+        def key_doc_start(self):      events.append(("combo", "ctrl+home"))
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def delete_key(self):         events.append(("key", "delete"))
@@ -1801,6 +1804,7 @@ def test_vscode_source_path_never_cleared():
 
     class FakeExec:
         def check_window(self):       return True
+        def key_doc_start(self):      events.append(("combo", "ctrl+home"))
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def key_save(self):           events.append(("combo", "ctrl+s"))
@@ -1839,6 +1843,7 @@ def test_vscode_keyboard_rel_to_workspace():
 
     class FakeExec:
         def check_window(self):       return True
+        def key_doc_start(self):      events.append(("combo", "ctrl+home"))
         def key_quick_open(self):     events.append(("combo", "ctrl+p"))
         def key_select_all(self):     events.append(("combo", "ctrl+a"))
         def delete_key(self):         events.append(("key", "delete"))

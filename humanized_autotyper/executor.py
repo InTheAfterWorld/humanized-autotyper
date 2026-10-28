@@ -385,6 +385,17 @@ class Executor:
             return
         self.tap_combo([self._Key.ctrl, self._Key.end], label="ctrl+end")
 
+    def key_doc_start(self):
+        """Ctrl+Home：把光标压回文档开头。
+
+        首次打开目标文件时用。VS Code 会为每个文件记住上次的光标位置，
+        `--goto` 与 Quick Open 都会把它恢复回来；不复位就会把新文本插到
+        旧内容中间。依赖组合键而非相对移动，与 key_doc_end 对称。
+        """
+        if self._Key is None:
+            return
+        self.tap_combo([self._Key.ctrl, self._Key.home], label="ctrl+home")
+
     def key_quick_open(self):
         """Ctrl+P（VSCode Quick Open）。"""
         keys = self._ctrl_key("p")
